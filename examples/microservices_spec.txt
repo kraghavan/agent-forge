@@ -1,0 +1,33 @@
+# Example Specification: Microservices Data Pipeline
+
+Create a 4-agent microservices system:
+
+Agent 1: PostgreSQL database
+- Run PostgreSQL in Docker
+- Create database called "analytics"
+- Create tables: users, events, aggregations
+- Available on port 5432
+
+Agent 2: Data Generator Service
+- Python FastAPI service
+- Generates random user events every 2 seconds
+- Inserts into events table
+- Events have: user_id, event_type, timestamp, metadata (JSON)
+
+Agent 3: Aggregation Service  
+- Python service with APScheduler
+- Runs aggregation every 30 seconds
+- Counts events by type and user
+- Stores results in aggregations table
+- Logs progress
+
+Agent 4: API Service
+- FastAPI REST API
+- Endpoints:
+  - GET /users - list all users
+  - GET /events - list recent events
+  - GET /stats - get aggregated statistics
+- Available on port 8000
+- Includes Swagger docs
+
+All services should have proper logging, error handling, and health checks.

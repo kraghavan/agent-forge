@@ -1,0 +1,32 @@
+# Example Specification: RabbitMQ Multi-Agent System
+
+Agent one will create a docker container and inside it, this one will create a rabbitmq instance. It will create 1 exchange called books and 2 queues called fictional and non-fictional. Let the rabbitmq be available via its default port.
+
+Agent 2 is a normal ubuntu 20 based docker image which runs a python script that publishes messages every so often. Expect this publisher to publish to fictional queue every 5 seconds and to non-fictional every 10 seconds.
+
+Agent 3 is a normal ubuntu 20 based docker image which runs a python script that consumes messages every so often.
+
+Here is the rabbitmq message payload sample you should follow:
+
+{
+  "header": {
+    "message_id": "uuid-v4-string",
+    "timestamp": "2026-01-28T15:51:00Z",
+    "version": "1.0",
+    "source": "content-engine-01"
+  },
+  "metadata": {
+    "genre_type": "fictional", 
+    "priority": "normal",
+    "ttl_seconds": 30
+  },
+  "payload": {
+    "entity_id": "book_98765",
+    "action": "location_update",
+    "coordinates": {
+      "lat": 49.262,
+      "lng": -122.781
+    },
+    "context": "The protagonist is moving toward the enchanted forest."
+  }
+}
