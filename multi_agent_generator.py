@@ -51,12 +51,20 @@ class MultiAgentGenerator:
             Dictionary mapping file paths to their contents
         """
         print("🤖 Generating multi-agent system using Claude API...")
-        print(f"📝 Spec length: {len(spec)} characters\n")
+        print(f"📝 Spec length: {len(spec)} characters")
+        
+        # Estimate input tokens
+        estimated_spec_tokens = len(spec) // 4  # ~4 chars per token
+        print(f"📊 Estimated spec tokens: ~{estimated_spec_tokens:,}")
+        print()
         
         # Create the prompt for Claude
         prompt = self._build_generation_prompt(spec)
         
         # Call Claude API
+        import time
+        start_time = time.time()
+        
         response = self.client.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=16000,
@@ -65,6 +73,30 @@ class MultiAgentGenerator:
                 "content": prompt
             }]
         )
+        
+        elapsed_time = time.time() - start_time
+        
+        # Print token usage statistics
+        usage = response.usage
+        total_tokens = usage.input_tokens + usage.output_tokens
+        
+        # Calculate cost (Sonnet 4.5 pricing as of Jan 2026)
+        input_cost = (usage.input_tokens / 1_000_000) * 3.00   # $3 per million input tokens
+        output_cost = (usage.output_tokens / 1_000_000) * 15.00  # $15 per million output tokens
+        total_cost = input_cost + output_cost
+        
+        print("\n" + "="*60)
+        print("📊 TOKEN USAGE REPORT")
+        print("="*60)
+        print(f"⏱️  Generation time:    {elapsed_time:.1f} seconds")
+        print(f"📥 Input tokens:        {usage.input_tokens:,}")
+        print(f"📤 Output tokens:       {usage.output_tokens:,}")
+        print(f"📊 Total tokens:        {total_tokens:,}")
+        print(f"💰 Input cost:          ${input_cost:.4f}")
+        print(f"💰 Output cost:         ${output_cost:.4f}")
+        print(f"💵 Total cost:          ${total_cost:.4f}")
+        print("="*60)
+        print()
         
         # Extract generated content
         content = response.content[0].text
@@ -80,7 +112,7 @@ class MultiAgentGenerator:
         # Write files to disk
         self._write_files(files, output_dir)
         
-        print(f"\n✅ Generated {len(files)} files in {output_dir}/")
+        print(f"✅ Generated {len(files)} files in {output_dir}/")
         
         # Auto-execute if requested
         if auto_execute:
@@ -163,9 +195,14 @@ Please generate the complete system now. Remember to use the exact format with `
         
         return files
     
-    def _write_files(self, files: Dict[str, str], output_dir: str):
+    def _write_files(self, files: Dict[str, str], output_dir: str, clean: bool = False):
         """Write generated files to disk"""
         output_path = Path(output_dir)
+        
+        # Optionally clean the directory first
+        if clean and output_path.exists():
+            import shutil
+            shutil.rmtree(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
         
         for filepath, content in files.items():
@@ -220,7 +257,8 @@ Please generate the complete system now. Remember to use the exact format with `
         Returns:
             Updated files dictionary
         """
-        print(f"🔄 Iterating on system: {modification}\n")
+        print(f"🔄 Iterating on system: {modification}")
+        print()
         
         # Build iteration prompt
         files_context = "\n\n".join([
@@ -245,6 +283,9 @@ Use the same format as before:
 ```
 """
         
+        import time
+        start_time = time.time()
+        
         response = self.client.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=16000,
@@ -253,6 +294,30 @@ Use the same format as before:
                 "content": prompt
             }]
         )
+        
+        elapsed_time = time.time() - start_time
+        
+        # Print token usage statistics
+        usage = response.usage
+        total_tokens = usage.input_tokens + usage.output_tokens
+        
+        # Calculate cost
+        input_cost = (usage.input_tokens / 1_000_000) * 3.00
+        output_cost = (usage.output_tokens / 1_000_000) * 15.00
+        total_cost = input_cost + output_cost
+        
+        print("\n" + "="*60)
+        print("📊 ITERATION TOKEN USAGE REPORT")
+        print("="*60)
+        print(f"⏱️  Generation time:    {elapsed_time:.1f} seconds")
+        print(f"📥 Input tokens:        {usage.input_tokens:,}")
+        print(f"📤 Output tokens:       {usage.output_tokens:,}")
+        print(f"📊 Total tokens:        {total_tokens:,}")
+        print(f"💰 Input cost:          ${input_cost:.4f}")
+        print(f"💰 Output cost:         ${output_cost:.4f}")
+        print(f"💵 Total cost:          ${total_cost:.4f}")
+        print("="*60)
+        print()
         
         content = response.content[0].text
         updated_files = self._parse_files_from_response(content)
@@ -264,7 +329,7 @@ Use the same format as before:
         # Write updated files
         self._write_files(updated_files, output_dir)
         
-        print(f"\n✅ Updated {len(updated_files)} files")
+        print(f"✅ Updated {len(updated_files)} files")
         
         return existing_files
 

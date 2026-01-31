@@ -108,6 +108,17 @@ Agent 1: MySQL database with 'app' database and 'users' table
 Agent 2: Python FastAPI service with CRUD endpoints on port 8000
 Agent 3: Python script that creates test users every 5 seconds
 ```
+### Multi agent to publish/consume from rabbimtq about books, influx database that monitors the rabbitmq metrics and graphana dashboard
+
+```
+# Generate the complete 5-agent monitoring system
+python multi_agent_generator.py @examples/monitoring-system-spec.txt -o ./monitoring-system
+
+# Run it
+cd monitoring-system
+docker-compose up --build
+```
+
 
 ## Command Line Options
 

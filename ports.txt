@@ -1,0 +1,13 @@
+🐰 RabbitMQ Management UI:    http://localhost:15672
+   Username: guest
+   Password: guest
+   Port: 5672 (Agents connect here)
+
+📊 InfluxDB UI:                http://localhost:8086
+   Username: admin
+   Password: password123
+   
+📈 Grafana Dashboards:         http://localhost:3000
+   Username: admin
+   Password: admin
+   new pswd: W5MEVA5vCEZYi@
