@@ -1,0 +1,77 @@
+# Example Specification: Multi-Agent System with Time Series Monitoring
+
+Agent 1 will create a docker container running RabbitMQ. It will create 1 exchange called books (direct type) and 2 queues called fictional and non-fictional. Let the rabbitmq be available via its default port 5672. Management UI should be on port 15672.
+
+Agent 2 is a normal ubuntu 20 based docker image which runs a python script that publishes messages. Expect this publisher to publish to fictional queue every 5 seconds and to non-fictional every 10 seconds. After publishing each message, this agent MUST send metrics to InfluxDB including: message count (1), publish duration in milliseconds, and timestamp. Use the influxdb-client Python library.
+
+Agent 3 is a normal ubuntu 20 based docker image which runs a python script that consumes messages from both queues. After consuming each message, this agent MUST send metrics to InfluxDB including: message count (1), processing duration in milliseconds, current queue depth, and timestamp. Use the influxdb-client Python library.
+
+Agent 4 is InfluxDB 2.x running on port 8086. Create an organization called "monitoring" and a bucket called "agent_metrics" with 30 day retention. Use admin username "admin" and password "password123". Generate an API token for the agents to use.
+
+Agent 5 is Grafana running on port 3000. Configure it with InfluxDB as a datasource automatically. Create a dashboard with these panels:
+- Panel 1: Line graph showing messages published and consumed over time (per minute)
+- Panel 2: Line graph showing average processing duration 
+- Panel 3: Gauge showing current queue depth for fictional and non-fictional queues
+- Panel 4: Stat panel showing total messages processed in the last hour
+
+All agents should connect to InfluxDB using these environment variables:
+INFLUXDB_URL=http://influxdb:8086
+INFLUXDB_TOKEN=(generated token)
+INFLUXDB_ORG=monitoring
+INFLUXDB_BUCKET=agent_metrics
+
+Here is the rabbitmq message payload sample you should follow:
+
+{
+  "header": {
+    "message_id": "uuid-v4-string",
+    "timestamp": "2026-01-30T15:51:00Z",
+    "version": "1.0",
+    "source": "content-engine-01"
+  },
+  "metadata": {
+    "genre_type": "fictional", 
+    "priority": "normal",
+    "ttl_seconds": 30
+  },
+  "payload": {
+    "entity_id": "book_98765",
+    "action": "location_update",
+    "coordinates": {
+      "lat": 49.262,
+      "lng": -122.781
+    },
+    "context": "The protagonist is moving toward the enchanted forest."
+  }
+}
+
+The metrics sent to InfluxDB should follow this format:
+- Measurement name: "publisher_metrics" or "consumer_metrics"
+- Tags: agent="publisher" or agent="consumer", queue="fictional" or queue="non-fictional"
+- Fields: messages_count=1, duration_ms=45.2, queue_depth=10 (for consumer only)
+- Timestamp: UTC time in nanoseconds
+
+Startup order is important:
+1. Start InfluxDB first and wait for it to be healthy
+2. Run setup script to create org, bucket, and token
+3. Start RabbitMQ and wait for it to be healthy  
+4. Run setup script to create exchange and queues
+5. Start Publisher and Consumer (they depend on both RabbitMQ and InfluxDB being ready)
+6. Start Grafana independently (does NOT block Publisher/Consumer, just reads existing data)
+
+For the InfluxDB setup, use a Python script with the influxdb-client library (NOT rabbitmqadmin style). The script should:
+- Wait for InfluxDB to be ready (retry with exponential backoff)
+- Create organization if it doesn't exist
+- Create bucket if it doesn't exist
+- Generate an API token
+- Save the token to a file that other agents can read
+
+For the RabbitMQ setup, use a Python script with the pika library. The script should:
+- Wait for RabbitMQ to be ready (retry with exponential backoff)
+- Declare the exchange
+- Declare the queues
+- Bind the queues to the exchange
+
+The Grafana dashboard should be provisioned automatically using a JSON file in /etc/grafana/provisioning/dashboards/ so users don't have to create it manually.
+
+All Python agents should have proper error handling and retry logic for both RabbitMQ and InfluxDB connections.
