@@ -1,4 +1,5 @@
-# this is a scratch file which specifies which services could by default be available in what port. Remeber this setup ins local to your device/server you run this one. 
+# this is a scratch file which specifies which services could by default be available in what port. 
+# Remember this setup is local to your device/server. 
 🐰 RabbitMQ Management UI:    http://localhost:15672
    Username: guest
    Password: guest
