@@ -1,3 +1,4 @@
+# this is a scratch file which specifies which services could by default be available in what port. Remeber this setup ins local to your device/server you run this one. 
 🐰 RabbitMQ Management UI:    http://localhost:15672
    Username: guest
    Password: guest
@@ -10,4 +11,3 @@
 📈 Grafana Dashboards:         http://localhost:3000
    Username: admin
    Password: admin
-   new pswd: W5MEVA5vCEZYi@
