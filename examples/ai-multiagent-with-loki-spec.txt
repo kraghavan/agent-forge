@@ -1,0 +1,626 @@
+# Specification: AI-Powered Multi-Agent System with Runtime Reasoning and Centralized Logging
+
+## Overview
+Create a multi-agent system where agents use Claude API at RUNTIME to make decisions and adapt their behavior. Includes centralized logging with Grafana Loki for full observability. Designed with COST CONTROLS to prevent excessive API charges.
+
+## System Architecture (8 Services Total)
+
+### Agent 1: RabbitMQ Message Broker
+- Docker container running RabbitMQ 3.x with management plugin
+- Exchange: "books" (direct type, durable)
+- Queues: "fictional", "non-fictional" (both durable)
+- Ports: 5672 (AMQP), 15672 (Management UI)
+- Purpose: Central message routing
+
+### Agent 2: AI Publisher Agents (2 replicas - publisher-1, publisher-2)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+- Each publisher runs INDEPENDENTLY with AI decision-making
+
+**COST CONTROL FEATURES:**
+- Maximum Claude API calls: 1 per 60 seconds (not 30s)
+- Fall back to default behavior if API fails
+- Token limit: max_tokens=300 (reduced from 500)
+- Dry-run mode available (set DRY_RUN=true to disable API calls)
+
+**AI Behavior:**
+- Every 60 seconds: Query InfluxDB for queue depths
+- Call Claude API with prompt:
+  ```
+  You are a publisher agent. Current queue depths: fictional={X}, non-fictional={Y}.
+  Should I adjust my publishing rate? Current: fictional=5s, non-fictional=10s.
+  Respond ONLY with JSON: {"action": "continue|slow_down|speed_up", "fictional_interval": X, "nonfictional_interval": Y, "reasoning": "brief explanation"}
+  ```
+- Claude responds with decision
+- Agent adjusts intervals based on decision
+- Logs decision to InfluxDB AND Loki (structured JSON)
+
+**Logging Format (to stdout, picked up by Loki):**
+```json
+{
+  "timestamp": "2026-01-31T10:15:30Z",
+  "level": "INFO|DEBUG|WARNING|ERROR|AI_DECISION",
+  "agent_id": "publisher-1",
+  "agent_type": "publisher",
+  "message": "Human readable message",
+  "context": {
+    "queue": "fictional",
+    "duration_ms": 45.2,
+    "ai_action": "slow_down",
+    "reasoning": "Queue depth high"
+  }
+}
+```
+
+**Metrics to InfluxDB:**
+- messages_published (counter)
+- publish_duration_ms (histogram)
+- queue_depth_at_decision (gauge)
+- ai_decision_count (counter)
+- ai_reasoning_text (string field)
+- tokens_used (counter)
+- decision_latency_ms (float)
+
+**Environment variables:**
+- ANTHROPIC_API_KEY
+- INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET
+- RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER, RABBITMQ_PASS
+- PUBLISHER_ID (publisher-1 or publisher-2)
+- DRY_RUN (true/false - if true, use mock AI responses)
+- MAX_TOKENS (default: 300)
+- DECISION_INTERVAL_SECONDS (default: 60)
+
+### Agent 3: AI Consumer Agents (2 replicas - consumer-1, consumer-2)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+
+**COST CONTROL:**
+- Only ask Claude for 1 in 10 messages (90% use default processing)
+- Maximum: 1 Claude API call per 30 seconds
+- Token limit: max_tokens=200
+
+**AI Behavior:**
+- On receiving message (1 in 10 chance):
+  - Call Claude API with prompt:
+    ```
+    Message received: genre={genre}, priority={priority}, queue_depth={depth}.
+    Should I: a) process_immediately, b) batch, c) flag_anomaly?
+    Respond ONLY with JSON: {"action": "process|batch|flag", "reasoning": "brief"}
+    ```
+  - Log decision to InfluxDB and Loki
+- For other 9/10 messages: Process immediately (no API call)
+
+**Logging Format:**
+```json
+{
+  "timestamp": "2026-01-31T10:15:30Z",
+  "level": "INFO|AI_DECISION",
+  "agent_id": "consumer-1",
+  "agent_type": "consumer",
+  "message": "Message consumed",
+  "context": {
+    "message_id": "abc-123",
+    "queue": "fictional",
+    "ai_decision_used": true,
+    "action": "process",
+    "processing_ms": 23.4
+  }
+}
+```
+
+**Metrics to InfluxDB:**
+- messages_consumed (counter)
+- processing_duration_ms (histogram)
+- ai_decision_count (counter)
+- tokens_used (counter)
+
+**Environment variables:**
+- ANTHROPIC_API_KEY
+- INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET
+- RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER, RABBITMQ_PASS
+- CONSUMER_ID (consumer-1 or consumer-2)
+- DRY_RUN (true/false)
+- AI_DECISION_RATE (default: 0.1 = 10% of messages)
+
+### Agent 4: AI Monitor Agent (1 instance - monitor-1)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+
+**COST CONTROL:**
+- Runs every 120 seconds (not 60s)
+- Token limit: max_tokens=400
+
+**AI Behavior:**
+- Every 120 seconds:
+  - Query InfluxDB for metrics summary (last 5 minutes)
+  - Call Claude API:
+    ```
+    System metrics: messages_published={X}, queue_depths={Y}, errors={Z}.
+    Detect issues? Status: healthy|warning|critical?
+    Respond ONLY with JSON: {"status": "healthy|warning|critical", "issues": [], "suggestions": []}
+    ```
+  - Log analysis to InfluxDB and Loki
+  - If critical: Print alert to console
+
+**Logging Format:**
+```json
+{
+  "timestamp": "2026-01-31T10:15:30Z",
+  "level": "WARNING|ERROR|AI_ANALYSIS",
+  "agent_id": "monitor-1",
+  "agent_type": "monitor",
+  "message": "System health check",
+  "context": {
+    "status": "healthy",
+    "issues": [],
+    "suggestions": ["Consider scaling consumers"]
+  }
+}
+```
+
+**Environment variables:**
+- ANTHROPIC_API_KEY
+- INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET
+- AGENT_ID (monitor-1)
+- DRY_RUN (true/false)
+
+### Agent 5: InfluxDB Time Series Database
+- InfluxDB 2.x on port 8086
+- Organization: "monitoring"
+- Bucket: "agent_metrics" (7 day retention - reduced from 30 for testing)
+- Admin: admin / password123
+- Stores metrics and AI reasoning
+
+### Agent 6: Loki Log Aggregation System
+- Grafana Loki on port 3100
+- Stores ALL application logs from all agents
+- Retention: 7 days (for testing)
+- Accessible via Grafana
+
+**Purpose:**
+- Collect logs from all containers
+- Enable full-text search
+- Correlate with metrics
+
+### Agent 7: Promtail Log Collector
+- Grafana Promtail (no port exposed)
+- Collects logs from Docker containers
+- Labels logs with: agent_id, agent_type, level
+- Ships to Loki
+
+**Log Processing:**
+- Reads from: /var/lib/docker/containers
+- Parses JSON logs
+- Adds labels for filtering
+- Sends to Loki
+
+### Agent 8: Grafana Visualization
+- Grafana on port 3000
+- Admin: admin / admin
+- Pre-configured with TWO datasources:
+  1. InfluxDB (for metrics)
+  2. Loki (for logs)
+
+**Dashboards to provision:**
+
+**Dashboard 1: System Overview**
+- Panel 1: Messages published/consumed (line graph from InfluxDB)
+- Panel 2: Queue depths (gauge from InfluxDB)
+- Panel 3: Agent logs - last 50 lines (table from Loki)
+
+**Dashboard 2: AI Decision Dashboard**
+- Panel 1: AI decisions over time (bar chart from InfluxDB)
+- Panel 2: AI reasoning logs (table from Loki, filter: level="AI_DECISION")
+- Panel 3: Token usage per agent (stacked area from InfluxDB)
+- Panel 4: Decision latency (line graph from InfluxDB)
+
+**Dashboard 3: Logs + Metrics Correlation**
+- Panel 1: Queue depth graph (InfluxDB)
+- Panel 2: Logs at same time range (Loki) - synced time range
+- Panel 3: Error rate (InfluxDB)
+- Panel 4: Error logs (Loki, filter: level="ERROR")
+
+**Dashboard 4: Cost Tracking**
+- Panel 1: Total tokens used (counter from InfluxDB)
+- Panel 2: Estimated cost (calculated: input×$3/M + output×$15/M)
+- Panel 3: API calls per hour (rate from InfluxDB)
+- Panel 4: Cost projection (if running 24h)
+
+---
+
+## Docker Compose Structure
+
+```yaml
+version: '3.8'
+
+services:
+  # Infrastructure
+  influxdb:
+    # InfluxDB service
+  
+  rabbitmq:
+    # RabbitMQ service
+  
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+  
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./promtail-config.yaml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+  
+  grafana:
+    # Grafana with both InfluxDB and Loki datasources
+  
+  # AI Agents
+  publisher-1:
+    build: ./publisher
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PUBLISHER_ID: publisher-1
+      DRY_RUN: ${DRY_RUN:-false}
+      DECISION_INTERVAL_SECONDS: 60
+      MAX_TOKENS: 300
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+      - loki
+    logging:
+      driver: json-file
+      options:
+        labels: "agent_id=publisher-1,agent_type=publisher"
+  
+  publisher-2:
+    build: ./publisher
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PUBLISHER_ID: publisher-2
+      DRY_RUN: ${DRY_RUN:-false}
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+      - loki
+  
+  consumer-1:
+    build: ./consumer
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CONSUMER_ID: consumer-1
+      DRY_RUN: ${DRY_RUN:-false}
+      AI_DECISION_RATE: 0.1
+      MAX_TOKENS: 200
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+      - loki
+  
+  consumer-2:
+    build: ./consumer
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CONSUMER_ID: consumer-2
+      DRY_RUN: ${DRY_RUN:-false}
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+      - loki
+  
+  monitor:
+    build: ./monitor
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      AGENT_ID: monitor-1
+      DRY_RUN: ${DRY_RUN:-false}
+      CHECK_INTERVAL_SECONDS: 120
+      MAX_TOKENS: 400
+    depends_on:
+      - influxdb-setup
+      - loki
+
+volumes:
+  influxdb-data:
+  loki-data:
+  shared-data:
+```
+
+---
+
+## Loki Configuration (loki-config.yaml)
+
+```yaml
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+ingester:
+  lifecycler:
+    address: 127.0.0.1
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+  chunk_idle_period: 5m
+  chunk_retain_period: 30s
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: boltdb
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  boltdb:
+    directory: /loki/index
+  filesystem:
+    directory: /loki/chunks
+
+limits_config:
+  retention_period: 168h  # 7 days
+  enforce_metric_name: false
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+chunk_store_config:
+  max_look_back_period: 168h
+
+table_manager:
+  retention_deletes_enabled: true
+  retention_period: 168h
+```
+
+---
+
+## Promtail Configuration (promtail-config.yaml)
+
+```yaml
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container_name'
+      
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+      
+      - source_labels: ['__meta_docker_container_label_agent_id']
+        target_label: 'agent_id'
+      
+      - source_labels: ['__meta_docker_container_label_agent_type']
+        target_label: 'agent_type'
+    
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            timestamp: timestamp
+            message: message
+            agent_id: agent_id
+            agent_type: agent_type
+      
+      - labels:
+          level:
+          agent_id:
+          agent_type:
+      
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+```
+
+---
+
+## Cost Control Features
+
+### 1. DRY_RUN Mode (Test Without Charges)
+
+```bash
+# Set this to test system without API calls
+export DRY_RUN=true
+
+# Agents will use mock responses instead of calling Claude
+# Mock response: {"action": "continue", "reasoning": "DRY RUN MODE"}
+```
+
+### 2. Rate Limiting
+
+```python
+# In agent code:
+import time
+
+class RateLimiter:
+    def __init__(self, min_interval_seconds=60):
+        self.min_interval = min_interval_seconds
+        self.last_call = 0
+    
+    def can_call_api(self):
+        now = time.time()
+        if now - self.last_call < self.min_interval:
+            return False
+        self.last_call = now
+        return True
+
+# Usage:
+limiter = RateLimiter(min_interval_seconds=60)
+
+if limiter.can_call_api():
+    decision = ask_claude_for_decision()
+else:
+    # Use default behavior
+    decision = {"action": "continue"}
+```
+
+### 3. Token Budgets
+
+```python
+# Track cumulative token usage
+total_tokens = 0
+MAX_TOKENS_PER_HOUR = 50000  # ~$1.50 max per hour
+
+def check_budget():
+    global total_tokens
+    if total_tokens > MAX_TOKENS_PER_HOUR:
+        logger.warning("Token budget exceeded, pausing AI decisions")
+        return False
+    return True
+
+# Before calling Claude:
+if not check_budget():
+    return default_decision()
+```
+
+---
+
+## Estimated Costs
+
+### Conservative Usage (Default Settings):
+```
+Publisher-1: 60 API calls/hour × 300 tokens = 18,000 tokens/hr
+Publisher-2: 60 API calls/hour × 300 tokens = 18,000 tokens/hr
+Consumer-1:  6 API calls/hour × 200 tokens = 1,200 tokens/hr (10% rate)
+Consumer-2:  6 API calls/hour × 200 tokens = 1,200 tokens/hr
+Monitor:     30 API calls/hour × 400 tokens = 12,000 tokens/hr
+
+Total: ~50,000 tokens/hour
+
+Cost: 
+- Input: 25,000 tokens × $3/M = $0.075/hr
+- Output: 25,000 tokens × $15/M = $0.375/hr
+- Total: ~$0.45/hour = ~$10.80/day if running 24/7
+```
+
+### With DRY_RUN for Testing:
+```
+Cost: $0 (no API calls)
+```
+
+### Recommended Testing:
+```
+1. Start with DRY_RUN=true (free)
+2. Once working, set DRY_RUN=false
+3. Run for 10 minutes ($0.08 cost)
+4. Check logs and dashboards
+5. Stop containers
+```
+
+---
+
+## Grafana Loki Query Examples
+
+### View all logs from publisher-1:
+```
+{agent_id="publisher-1"}
+```
+
+### View only AI decisions:
+```
+{level="AI_DECISION"}
+```
+
+### View errors from any agent:
+```
+{level="ERROR"}
+```
+
+### Correlate with time:
+```
+{agent_type="publisher"} | json | line_format "{{.message}}: {{.context.reasoning}}"
+```
+
+### Filter by action:
+```
+{level="AI_DECISION"} | json | context_ai_action="slow_down"
+```
+
+---
+
+## Startup Sequence
+
+1. Start InfluxDB, wait for healthy
+2. Run setup-influxdb.py
+3. Start RabbitMQ, wait for healthy
+4. Run setup-rabbitmq.py
+5. Start Loki
+6. Start Promtail (depends on Loki)
+7. Start Grafana (configure both datasources)
+8. Start all AI agents (publisher-1, publisher-2, consumer-1, consumer-2, monitor)
+
+---
+
+## Testing Checklist
+
+After starting system:
+
+✅ **RabbitMQ:** http://localhost:15672 (guest/guest)
+✅ **InfluxDB:** http://localhost:8086 (admin/password123)
+✅ **Grafana:** http://localhost:3000 (admin/admin)
+✅ **Loki:** http://localhost:3100/ready (should return "ready")
+
+In Grafana:
+✅ Check "AI Decision Dashboard" - see AI decisions appearing
+✅ Check "Logs + Metrics" - see correlation
+✅ Check "Cost Tracking" - monitor token usage
+✅ Query Loki: `{agent_type="publisher"}` - see structured logs
+
+---
+
+## Requirements
+
+```txt
+anthropic>=0.40.0
+influxdb-client>=1.40.0
+pika>=1.3.0
+```
+
+---
+
+## Safety Features
+
+1. **Token budget enforcement** - Pause if exceeds limit
+2. **Rate limiting** - Max 1 call per X seconds per agent
+3. **Graceful degradation** - Fall back to defaults if API fails
+4. **DRY_RUN mode** - Test without charges
+5. **Short retention** - 7 days (not 30) to save storage
+
+---
+
+## Success Criteria
+
+After 10 minutes of running:
+
+✅ See AI decisions in both InfluxDB and Loki
+✅ Grafana shows logs + metrics together
+✅ Can search logs: "Show me when queue spiked"
+✅ Can correlate: "What did agents decide at 10:15?"
+✅ Cost < $0.10 for 10 minute run
+
+---
+
+This spec includes EVERYTHING: AI agents, metrics, logs, correlation, and cost controls!
