@@ -112,7 +112,7 @@ Agent 3: Python script that creates test users every 5 seconds
 
 ```
 # Generate the complete 5-agent monitoring system
-python multi_agent_generator.py @examples/monitoring-system-spec.txt -o ./monitoring-system
+python multi_agent_generator.py @examples/monitoring_system_spec.txt -o ./monitoring-system
 
 # Run it
 cd monitoring-system
@@ -312,34 +312,112 @@ export ANTHROPIC_API_KEY='your-key'
 python multi_agent_generator.py --api-key your-key "spec"
 ```
 
-## Examples Included
+## New: Staged Multi-Agent Generator (multi_agent_generator_staged.py)
 
-Check the `examples/` directory for sample specifications:
+This repository includes an improved "staged" multi-agent system generator that avoids token limits by generating files in multiple passes and can optionally download raw assistant responses for audit/debugging.
 
-- `rabbitmq_spec.txt` - Message queue system
-- `microservices_spec.txt` - Data pipeline with multiple services
+Highlights
+- Staged generation: manifest → grouped/batched file generation → per-file fallback → final verification.
+- Batched requests to the LLM keep prompts smaller and make generation more robust.
+- Optional download of the raw Claude responses for each generated file, useful for auditing and re-running generation.
+- Tracks estimated token usage and approximate cost.
 
-## Advanced Features
+How it works (high level)
+1. Phase 1 — Manifest: The tool reads your specification and asks the model to return a JSON array of all files to generate.
+2. Phase 2 — Grouped generation: Files are grouped (infrastructure, publishers, consumers, config, etc.) and generated in small batches to avoid token truncation.
+3. Phase 3 — Fallback & verification: Any missing files are generated individually using available context; finally all files are written to disk.
+4. Optional — Download responses: If enabled, the raw model responses used to create each file are saved for inspection.
 
-### Custom Models
+CLI usage examples
+- Basic generation:
+  ```
+  python3 multi_agent_generator_staged.py @spec.txt -o ./generated-system
+  ```
 
-```python
-# In the code, you can modify the model:
-# Change line: model="claude-sonnet-4-5-20250929"
-# To: model="claude-opus-4-5-20251101"  # for more complex systems
+- With explicit API key (or set env var ANTHROPIC_API_KEY):
+  ```
+  python3 multi_agent_generator_staged.py @spec.txt -o ./generated-system --api-key $ANTHROPIC_API_KEY
+  ```
+
+- Enable saving raw model responses (new flag):
+  ```
+  python3 multi_agent_generator_staged.py @spec.txt -o ./generated-system --download-responses
+  ```
+
+Note: The `@` prefix reads the spec from a file (e.g., `@spec.txt`).
+
+Output layout and downloaded responses
+- Project files are written to the output directory (default: `./generated-system`).
+- If response download is enabled, raw model responses are stored under:
+  - `./generated-system/claude-responses/` — one file per model call (JSON or .txt), named for the phase and target (e.g. `manifest.json`, `batch-infra-1.json`, `single-file-<sanitized-path>.txt`).
+- Generated files and raw responses can be used together to reproduce or debug generation decisions.
+
+Spec best practices
+- Provide a clear, focused specification. The generator estimates tokens and will split work into batches, but concise specs make generation more reliable.
+- If you need the tool to include additional files (configs, Dockerfiles, etc.), list them in the spec or in an explicit "files" section.
+
+Environment & costs
+- Set ANTHROPIC_API_KEY in your environment or pass `--api-key`.
+- The generator reports estimated token usage and an approximate cost summary when finished. Monitor usage if you have a budget.
+
+Troubleshooting
+- Failure to parse manifest: ensure the spec prompts the model to return a pure JSON array of file paths.
+- Missing files after generation: Run again with `--download-responses` to inspect the model outputs and re-run individual file generation as needed.
+- Permission/file system errors: ensure the output directory is writable.
+
+Security & auditing
+- Downloaded model responses allow you to audit the exact text the model returned. Treat these artifacts as potentially sensitive (they may contain spec text or generated secrets).
+- Rotate and secure API keys; do not commit downloaded responses or API keys to source control.
+
+Examples and next steps
+- Start with a small spec that requests only a few files, verify the outputs, then expand the spec to generate the full system.
+- Use the response files to iterate on prompts or to seed local tests that validate generated code.
+
+## Using both generators: original and staged
+
+This repo provides two generator entry points:
+
+- multi_agent_generator.py — single-call generator that asks Claude for the full project in one response (good for smaller specs).
+- multi_agent_generator_staged.py — staged/iterative generator that builds a manifest, generates files in batches, falls back to single-file generation, and can optionally save raw model responses for auditing.
+
+Quick CLI examples
+
+- Original (single-call):
+```
+python multi_agent_generator.py @spec.txt -o ./generated-system --execute
 ```
 
-### Extracting Specific Files
-
-```python
-files = generator.generate_system(spec)
-
-# Get just the docker-compose
-compose = files.get('docker-compose.yml')
-
-# Get all Python files
-python_files = {k: v for k, v in files.items() if k.endswith('.py')}
+- Staged (batched generation, save raw responses):
 ```
+python3 multi_agent_generator_staged.py @spec.txt -o ./generated-system --download-responses
+```
+
+Programmatic usage examples
+
+- Using the original generator (multi_agent_generator.py):
+```python
+from multi_agent_generator import MultiAgentGenerator
+
+gen = MultiAgentGenerator(api_key="YOUR_KEY")
+spec = "Two agents: RabbitMQ broker and a Python worker that processes jobs."
+files = gen.generate_system(spec, output_dir="./out-single")
+print(f"Generated {len(files)} files")
+```
+
+- Using the staged generator (multi_agent_generator_staged.py):
+```python
+from multi_agent_generator_staged import ImprovedMultiAgentGenerator
+
+gen = ImprovedMultiAgentGenerator(api_key="YOUR_KEY")
+spec = "Three agents: broker, publisher, consumer. Include monitoring stack."
+files = gen.generate_system(spec, output_dir="./out-staged")
+# If using CLI --download-responses, raw model responses are saved under ./out-staged/claude-responses/
+print(f"Generated {len(files)} files (staged)")
+```
+
+Notes
+- Pick the single-call generator for short, well-bounded specs. Use the staged generator for larger systems or when token limits/errors become a concern.
+- The staged generator's downloaded responses (when enabled) are useful for debugging parsing failures or iterating on prompts.
 
 ## Contributing
 
