@@ -1,0 +1,71 @@
+flowchart TB
+    subgraph External["☁️ External"]
+        Claude["Claude API<br/>Anthropic"]
+    end
+
+    subgraph Agents["🤖 AI Agents"]
+        P1["Publisher-1"]
+        P2["Publisher-2"]
+        C1["Consumer-1"]
+        C2["Consumer-2"]
+        MON["Monitor"]
+    end
+
+    subgraph Messaging["📨 Message Broker"]
+        RMQ["RabbitMQ"]
+        FQ["fictional queue"]
+        NFQ["non-fictional queue"]
+        RMQ --> FQ
+        RMQ --> NFQ
+    end
+
+    subgraph VectorMemory["🧠 Vector Memory"]
+        ST["Sentence Transformers<br/>all-MiniLM-L6-v2"]
+        QD["Qdrant<br/>book_messages collection"]
+        ST <--> QD
+    end
+
+    subgraph Observability["📊 Observability"]
+        INF["InfluxDB<br/>Metrics"]
+        LOKI["Loki<br/>Logs"]
+        PT["Promtail"]
+        GF["Grafana<br/>Dashboards"]
+        PT --> LOKI
+        INF --> GF
+        LOKI --> GF
+    end
+
+    %% Publisher Flow
+    P1 & P2 -->|"1 call/60s"| Claude
+    P1 & P2 -->|"publish"| RMQ
+    P1 & P2 -.->|"metrics"| INF
+
+    %% Consumer Flow
+    FQ & NFQ -->|"consume"| C1 & C2
+    C1 & C2 <-->|"embeddings"| ST
+    C1 & C2 -->|"10% msgs<br/>skip if hit>0.85"| Claude
+    C1 & C2 -.->|"metrics"| INF
+
+    %% Monitor Flow
+    MON -->|"query"| INF
+    MON -->|"query"| QD
+    MON -->|"1 call/120s"| Claude
+
+    %% Logging
+    P1 & P2 & C1 & C2 & MON -.->|"JSON logs"| PT
+
+    style Claude fill:#ef4444,stroke:#dc2626,color:#fff
+    style P1 fill:#22c55e,stroke:#16a34a,color:#fff
+    style P2 fill:#22c55e,stroke:#16a34a,color:#fff
+    style C1 fill:#22c55e,stroke:#16a34a,color:#fff
+    style C2 fill:#22c55e,stroke:#16a34a,color:#fff
+    style MON fill:#22c55e,stroke:#16a34a,color:#fff
+    style RMQ fill:#f97316,stroke:#ea580c,color:#fff
+    style FQ fill:#fdba74,stroke:#f97316,color:#000
+    style NFQ fill:#fdba74,stroke:#f97316,color:#000
+    style QD fill:#a855f7,stroke:#9333ea,color:#fff
+    style ST fill:#c084fc,stroke:#a855f7,color:#fff
+    style INF fill:#3b82f6,stroke:#2563eb,color:#fff
+    style LOKI fill:#3b82f6,stroke:#2563eb,color:#fff
+    style PT fill:#60a5fa,stroke:#3b82f6,color:#fff
+    style GF fill:#3b82f6,stroke:#2563eb,color:#fff

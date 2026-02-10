@@ -1,0 +1,398 @@
+# Specification: AI-Powered Multi-Agent System with Runtime Reasoning
+
+## Overview
+Create a multi-agent system where agents use Claude API at RUNTIME to make decisions and adapt their behavior based on system metrics. This is NOT just code generation - agents actively reason and make choices while running.
+
+## System Architecture (5 Agent Types, Multiple Instances)
+
+### Agent 1: RabbitMQ Message Broker
+- Docker container running RabbitMQ 3.x with management plugin
+- Exchange: "books" (direct type, durable)
+- Queues: "fictional", "non-fictional", "priority" (all durable)
+- Ports: 5672 (AMQP), 15672 (Management UI)
+- Purpose: Central message routing
+
+### Agent 2: AI Publisher Agents (2-3 replicas)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+- Each publisher runs INDEPENDENTLY with AI decision-making
+- **AI Behavior:**
+  - Every 30 seconds: Query InfluxDB for queue depths
+  - Call Claude API with prompt: "Queue depths are: fictional={X}, non-fictional={Y}. Should I adjust my publishing rate? Current rate: fictional=5s, non-fictional=10s"
+  - Claude responds with JSON: {"action": "continue|slow_down|speed_up|pause", "fictional_interval": X, "nonfictional_interval": Y, "reasoning": "..."}
+  - Agent adjusts intervals based on Claude's decision
+  - Logs decision to InfluxDB: measurement="agent_reasoning", tags={agent_id, agent_type="publisher"}, fields={action, reasoning, confidence, tokens_used}
+
+- **Metrics to track:**
+  - messages_published (counter)
+  - publish_duration_ms (histogram)
+  - queue_depth_at_decision (gauge)
+  - ai_decision_count (counter)
+  - ai_reasoning_text (string field)
+  - ai_confidence_score (0.0-1.0)
+  - tokens_used_per_decision (counter)
+  - decision_latency_ms (time to get Claude response)
+
+- **Environment variables needed:**
+  - ANTHROPIC_API_KEY (for Claude API)
+  - INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET
+  - RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER, RABBITMQ_PASS
+  - PUBLISHER_ID (unique: publisher-1, publisher-2, publisher-3)
+
+### Agent 3: AI Consumer Agents (2-3 replicas)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+- Each consumer runs INDEPENDENTLY with AI decision-making
+- **AI Behavior:**
+  - On receiving message: Extract message content
+  - Call Claude API with prompt: "I received message: {message_content}. Based on genre_type={genre}, priority={priority}, and current queue_depth={depth}, should I: a) Process immediately, b) Batch with others, c) Flag as anomaly?"
+  - Claude responds with JSON: {"action": "process|batch|flag_anomaly", "reasoning": "...", "confidence": 0.95}
+  - Agent takes action based on decision
+  - Logs decision to InfluxDB: measurement="agent_reasoning", tags={agent_id, agent_type="consumer", queue}, fields={action, reasoning, confidence, message_id}
+
+- **Metrics to track:**
+  - messages_consumed (counter)
+  - processing_duration_ms (histogram)
+  - ai_decision_count (counter)
+  - ai_reasoning_text (string field)
+  - anomalies_flagged (counter)
+  - batched_messages (counter)
+  - immediate_processing (counter)
+
+- **Environment variables needed:**
+  - ANTHROPIC_API_KEY
+  - INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG, INFLUXDB_BUCKET
+  - RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER, RABBITMQ_PASS
+  - CONSUMER_ID (unique: consumer-1, consumer-2, consumer-3)
+
+### Agent 4: AI Monitor Agent (1 instance)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+- **AI Behavior:**
+  - Every 60 seconds: Query InfluxDB for last 5 minutes of metrics
+  - Aggregate: total messages, queue depths, error rates, agent decisions
+  - Call Claude API with prompt: "System metrics: {metrics_summary}. Detect any issues? Should I alert? Any optimization suggestions?"
+  - Claude analyzes and responds with JSON: {"status": "healthy|warning|critical", "issues": [...], "suggestions": [...], "alerts": [...]}
+  - Agent logs analysis to InfluxDB
+  - If critical: Could send alerts (print to console for now)
+
+- **Metrics to track:**
+  - system_health_score (0-100)
+  - issues_detected (counter)
+  - suggestions_made (counter)
+  - ai_analysis_text (string field)
+
+### Agent 5: InfluxDB Time Series Database
+- InfluxDB 2.x on port 8086
+- Organization: "monitoring"
+- Bucket: "agent_metrics" (30 day retention)
+- Admin: admin / password123
+- Stores ALL metrics including AI reasoning
+
+### Agent 6: Grafana Visualization
+- Grafana on port 3000
+- Admin: admin / admin
+- Pre-configured dashboards:
+  
+  **Dashboard 1: Agent Overview**
+  - Panel 1: Messages published/consumed over time (by agent instance)
+  - Panel 2: Queue depths (real-time)
+  - Panel 3: Active agents count
+  
+  **Dashboard 2: AI Decision Dashboard** (NEW!)
+  - Panel 1: AI decisions over time (grouped by action: speed_up, slow_down, pause, etc.)
+  - Panel 2: Table showing recent agent reasoning (timestamp, agent_id, action, reasoning text)
+  - Panel 3: Decision confidence scores (time series)
+  - Panel 4: Token usage by agent (cost tracking)
+  - Panel 5: Decision latency (how long Claude takes to respond)
+  
+  **Dashboard 3: Agent Effectiveness** (NEW!)
+  - Panel 1: Compare AI decisions vs queue depth changes (did slowing down work?)
+  - Panel 2: Anomalies detected vs actual issues
+  - Panel 3: Agent response time before/after decisions
+  
+  **Dashboard 4: Cost & Performance**
+  - Panel 1: Total API tokens used (per agent, per hour)
+  - Panel 2: Cost estimation ($3/M input, $15/M output)
+  - Panel 3: Decision frequency (are we calling Claude too often?)
+
+## Message Format
+
+All messages MUST follow this schema:
+
+```json
+{
+  "header": {
+    "message_id": "uuid-v4-string",
+    "timestamp": "2026-01-31T15:51:00Z",
+    "version": "1.0",
+    "source": "publisher-1|publisher-2|publisher-3"
+  },
+  "metadata": {
+    "genre_type": "fictional|non-fictional",
+    "priority": "low|normal|high",
+    "ttl_seconds": 30,
+    "publisher_reasoning": "Why this message was sent (from AI)"
+  },
+  "payload": {
+    "entity_id": "book_xxxxx",
+    "action": "location_update",
+    "coordinates": {
+      "lat": 49.262,
+      "lng": -122.781
+    },
+    "context": "Event description"
+  }
+}
+```
+
+## InfluxDB Schema for AI Metrics
+
+### Measurement: "agent_reasoning"
+```
+Tags:
+  - agent_id: "publisher-1", "consumer-2", "monitor-1"
+  - agent_type: "publisher", "consumer", "monitor"
+  - action: "speed_up", "slow_down", "pause", "process", "batch", "flag_anomaly"
+  - decision_type: "rate_adjustment", "message_handling", "system_health"
+
+Fields:
+  - reasoning: "Text explanation from Claude"
+  - confidence: 0.0-1.0 (how confident is Claude)
+  - fictional_interval: <int> (for publishers)
+  - nonfictional_interval: <int> (for publishers)
+  - queue_depth_fictional: <int> (context at decision time)
+  - queue_depth_nonfictional: <int>
+  - tokens_used: <int> (API cost)
+  - decision_latency_ms: <float>
+  - outcome_success: true|false (did decision help? - track later)
+
+Timestamp: UTC nanoseconds
+```
+
+### Measurement: "publisher_metrics"
+```
+Tags:
+  - agent_id: "publisher-1", "publisher-2", "publisher-3"
+  - queue: "fictional", "non-fictional"
+
+Fields:
+  - messages_published: 1
+  - duration_ms: <float>
+  - current_interval: <int> (current publishing interval)
+  - ai_adjusted: true|false (was interval AI-adjusted?)
+
+Timestamp: UTC nanoseconds
+```
+
+### Measurement: "consumer_metrics"
+```
+Tags:
+  - agent_id: "consumer-1", "consumer-2", "consumer-3"
+  - queue: "fictional", "non-fictional"
+  - processing_action: "immediate", "batched", "flagged"
+
+Fields:
+  - messages_consumed: 1
+  - processing_duration_ms: <float>
+  - queue_depth: <int>
+  - ai_decision_used: true|false
+
+Timestamp: UTC nanoseconds
+```
+
+## Claude API Integration Pattern
+
+Each agent should use this pattern:
+
+```python
+def ask_claude_for_decision(self, context: dict) -> dict:
+    """Ask Claude API for decision based on context"""
+    
+    # Build prompt with current context
+    prompt = f"""You are an AI agent in a distributed system.
+    
+Context:
+{json.dumps(context, indent=2)}
+
+Your task: [specific to agent type]
+
+Respond ONLY with valid JSON in this format:
+{{
+  "action": "...",
+  "reasoning": "...",
+  "confidence": 0.95,
+  "suggested_params": {{...}}
+}}
+"""
+    
+    import time
+    start = time.time()
+    
+    response = self.claude.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=500,  # Keep responses concise
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    latency = (time.time() - start) * 1000
+    
+    # Parse response
+    decision_text = response.content[0].text
+    # Strip markdown code fences if present
+    decision_text = decision_text.replace('```json', '').replace('```', '').strip()
+    decision = json.loads(decision_text)
+    
+    # Add metadata
+    decision['tokens_used'] = response.usage.input_tokens + response.usage.output_tokens
+    decision['decision_latency_ms'] = latency
+    
+    return decision
+```
+
+## Startup Sequence
+
+CRITICAL - agents must start in this order:
+
+1. Start InfluxDB
+2. Wait for InfluxDB healthy
+3. Run setup-influxdb.py (create org, bucket, token)
+4. Start RabbitMQ
+5. Wait for RabbitMQ healthy
+6. Run setup-rabbitmq.py (create exchange, queues)
+7. Start Grafana (provision datasources and dashboards)
+8. Start AI Publisher agents (publisher-1, publisher-2, publisher-3)
+9. Start AI Consumer agents (consumer-1, consumer-2, consumer-3)
+10. Start AI Monitor agent (monitor-1)
+
+## Docker Compose Configuration
+
+```yaml
+version: '3.8'
+
+services:
+  # ... InfluxDB, RabbitMQ, Grafana as before ...
+  
+  publisher-1:
+    build: ./publisher
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PUBLISHER_ID: publisher-1
+      # ... other env vars ...
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+  
+  publisher-2:
+    build: ./publisher
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PUBLISHER_ID: publisher-2
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+  
+  publisher-3:
+    build: ./publisher
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PUBLISHER_ID: publisher-3
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+  
+  consumer-1:
+    build: ./consumer
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CONSUMER_ID: consumer-1
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+  
+  consumer-2:
+    build: ./consumer
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CONSUMER_ID: consumer-2
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+  
+  consumer-3:
+    build: ./consumer
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CONSUMER_ID: consumer-3
+    depends_on:
+      - influxdb-setup
+      - rabbitmq-setup
+  
+  monitor:
+    build: ./monitor
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      AGENT_ID: monitor-1
+    depends_on:
+      - influxdb-setup
+```
+
+## Requirements File Updates
+
+```
+anthropic>=0.40.0
+influxdb-client>=1.40.0
+pika>=1.3.0
+```
+
+## Implementation Notes
+
+1. **Error Handling:** All agents MUST handle Claude API failures gracefully
+   - Retry with exponential backoff (max 3 retries)
+   - Fall back to default behavior if API unavailable
+   - Log API failures to InfluxDB
+
+2. **Rate Limiting:** 
+   - Don't call Claude on EVERY message
+   - Publishers: Every 30 seconds for rate adjustment
+   - Consumers: Sample (e.g., 1 in 10 messages) or batch decisions
+   - Monitor: Every 60 seconds
+
+3. **Cost Control:**
+   - Use max_tokens=500 to limit response size
+   - Use Sonnet (not Opus) for speed and cost
+   - Track token usage in InfluxDB
+   - Set budget alerts
+
+4. **Testing:**
+   - Include a "dry run" mode (no actual Claude API calls, use mock responses)
+   - Log all prompts and responses for debugging
+   - Track decision outcomes (did the decision help?)
+
+## Success Criteria
+
+After running for 10 minutes, you should see:
+- ✅ Multiple publisher/consumer instances running
+- ✅ AI decisions appearing in InfluxDB
+- ✅ Grafana showing agent reasoning
+- ✅ Agents adapting their behavior (intervals changing)
+- ✅ Token usage and costs tracked
+- ✅ System responding to load changes
+
+## Differences from Static System
+
+| Aspect | Static System | AI Multi-Agent System |
+|--------|---------------|----------------------|
+| Claude Usage | One-time code generation | Runtime decision-making |
+| Behavior | Fixed loops | Adaptive based on metrics |
+| Metrics | Basic counters | AI reasoning + decisions |
+| Scalability | Fixed 1:1 agents | Multiple replicas, coordinated |
+| Debugging | Check code/logs | Check AI reasoning in Grafana |
+| Cost | ~$0.25 once | ~$1-5/hour (depending on decision frequency) |
+
+## Next Phase (After This Works)
+
+Once this is working with Docker Compose, we'll convert to:
+- Kubernetes deployment manifests
+- Horizontal Pod Autoscaling (based on AI decisions!)
+- Free hosting options (k3s on free tier VMs)
+- Vector DB integration for agent memory
+
+But first: Let's get the AI agents making real-time decisions! 🤖
