@@ -46,6 +46,18 @@ Create a multi-agent system where agents use Claude API at RUNTIME to make decis
   )
   ```
 
+**6. Qdrant Healthcheck (CRITICAL):**
+- Qdrant container does NOT have `wget` or `curl` installed
+- **DO NOT** use healthcheck with wget/curl - it will always fail
+- **DO NOT** use `condition: service_healthy` for qdrant dependencies
+- Use `condition: service_started` instead for all qdrant dependencies
+- Example:
+  ```yaml
+  depends_on:
+    qdrant:
+      condition: service_started  # NOT service_healthy!
+  ```
+
 ---
 
 ## System Architecture (9 Services Total)
@@ -386,11 +398,8 @@ services:
       - qdrant-storage:/qdrant/storage
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:6333/healthz"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # NOTE: No healthcheck - Qdrant container lacks wget/curl
+    # Use service_started instead of service_healthy in depends_on
     networks:
       - agent-network
   
@@ -412,7 +421,7 @@ services:
       loki:
         condition: service_healthy
       qdrant:
-        condition: service_healthy
+        condition: service_started
     networks:
       - agent-network
   
@@ -551,7 +560,7 @@ services:
       rabbitmq-setup:
         condition: service_completed_successfully
       qdrant:
-        condition: service_healthy
+        condition: service_started
       loki:
         condition: service_healthy
     networks:
@@ -594,7 +603,7 @@ services:
       rabbitmq-setup:
         condition: service_completed_successfully
       qdrant:
-        condition: service_healthy
+        condition: service_started
       loki:
         condition: service_healthy
     networks:
@@ -619,7 +628,7 @@ services:
       influxdb-setup:
         condition: service_completed_successfully
       qdrant:
-        condition: service_healthy
+        condition: service_started
       loki:
         condition: service_healthy
     networks:
@@ -1198,6 +1207,23 @@ After generation, verify these in generated files:
 ---
 
 ## COMMON ERRORS AND FIXES
+
+### Error: `container for service "qdrant" is unhealthy`
+**Cause:** Qdrant container doesn't have `wget` or `curl` installed, so healthcheck fails  
+**Fix:** Either remove healthcheck from qdrant service entirely, OR change dependencies to use `service_started` instead of `service_healthy`:
+```yaml
+# Remove this from qdrant service:
+healthcheck:
+  test: ["CMD", "wget", "--spider", "-q", "http://localhost:6333/healthz"]  # wget not available!
+
+# Change dependencies from:
+qdrant:
+  condition: service_healthy
+
+# To:
+qdrant:
+  condition: service_started
+```
 
 ### Error: `field enforce_metric_name not found in type validation.plain`
 **Cause:** Using deprecated `enforce_metric_name` in loki-config.yaml  
