@@ -1,0 +1,1440 @@
+# Specification: AI Multi-Agent System with Vector DB Memory (Qdrant + Sentence Transformers)
+
+## Overview
+Create a multi-agent system where agents use Claude API at RUNTIME to make decisions, with VECTOR DATABASE for semantic memory and agent learning. Includes Qdrant for vector storage, Sentence Transformers for embeddings, and full observability with InfluxDB, Loki, and Grafana. Designed with COST CONTROLS.
+
+## ⚠️ CRITICAL REQUIREMENTS (Read First!)
+
+**1. InfluxDB Token Management:**
+- Use INFLUXDB_TOKEN environment variable (NOT file-based approach)
+- docker-compose.yml: Set `INFLUXDB_TOKEN=my-super-secret-auth-token` for ALL agents
+- Python code: Read token with `token = os.getenv('INFLUXDB_TOKEN')`
+- **DO NOT** use INFLUXDB_TOKEN_FILE or /shared/influxdb-token.txt
+- **DO NOT** have setup scripts write token files
+
+**2. All Python Files Must Be COMPLETE:**
+- Full imports at the top
+- Complete class definitions
+- Complete method implementations (no "# TODO" or "# implementation here")
+- Proper error handling with try/except
+- Structured JSON logging
+
+**3. Docker Compose Requirements:**
+- InfluxDB must have `DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token`
+- All agents (publisher, consumer, monitor) must have `INFLUXDB_TOKEN=my-super-secret-auth-token`
+- Use healthchecks and proper depends_on conditions
+- **CRITICAL:** Use proper `depends_on` YAML syntax (see examples below)
+
+**4. Loki Configuration (v2.9+):**
+- **DO NOT** use deprecated fields: `enforce_metric_name`, `max_look_back_period`, `shared_store`
+- These fields were removed in modern Loki versions and will cause startup failures
+- Pin version to `grafana/loki:2.9.0` (not just `2.9`)
+
+**5. Claude API Model Configuration:**
+- **DO NOT** use old model names like `claude-3-5-sonnet-20241022` - they no longer exist!
+- Use current model names:
+  - `claude-sonnet-4-20250514` (recommended for cost/performance balance)
+  - `claude-opus-4-5-20251101` (most advanced, higher cost)
+  - `claude-sonnet-4-5-20250929` (latest Sonnet)
+  - `claude-haiku-4-5-20251001` (fastest, lowest cost)
+- Example Python code:
+  ```python
+  response = client.messages.create(
+      model="claude-sonnet-4-20250514",  # Use valid model name!
+      max_tokens=300,
+      messages=[{"role": "user", "content": prompt}]
+  )
+  ```
+
+---
+
+## System Architecture (9 Services Total)
+
+### Agent 1: RabbitMQ Message Broker
+- Docker container running RabbitMQ 3.x with management plugin
+- Exchange: "books" (direct type, durable)
+- Queues: "fictional", "non-fictional" (both durable)
+- Ports: 5672 (AMQP), 15672 (Management UI)
+- Purpose: Central message routing
+
+### Agent 2: AI Publisher Agents (2 replicas - publisher-1, publisher-2)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+- Each publisher runs INDEPENDENTLY with AI decision-making
+
+**COST CONTROL FEATURES:**
+- Maximum Claude API calls: 1 per 60 seconds
+- Fall back to default behavior if API fails
+- Token limit: max_tokens=300
+- Dry-run mode available (set DRY_RUN=true to disable API calls)
+
+**AI Behavior:**
+- Every 60 seconds: Query InfluxDB for queue depths
+- Call Claude API with prompt:
+  ```
+  You are a publisher agent. Current queue depths: fictional={X}, non-fictional={Y}.
+  Should I adjust my publishing rate? Current: fictional=5s, non-fictional=10s.
+  Respond ONLY with JSON: {"action": "continue|slow_down|speed_up", "fictional_interval": X, "nonfictional_interval": Y, "reasoning": "brief explanation"}
+  ```
+- Claude responds with decision
+- Agent adjusts intervals based on decision
+- Logs decision to InfluxDB AND Loki (structured JSON)
+
+**Logging Format (to stdout, picked up by Loki):**
+```json
+{
+  "timestamp": "2026-02-04T10:15:30Z",
+  "level": "INFO|DEBUG|WARNING|ERROR|AI_DECISION",
+  "agent_id": "publisher-1",
+  "agent_type": "publisher",
+  "message": "Human readable message",
+  "context": {
+    "queue": "fictional",
+    "duration_ms": 45.2,
+    "ai_action": "slow_down",
+    "reasoning": "Queue depth high"
+  }
+}
+```
+
+**Metrics to InfluxDB:**
+- messages_published (counter)
+- publish_duration_ms (histogram)
+- queue_depth_at_decision (gauge)
+- ai_decision_count (counter)
+- ai_reasoning_text (string field)
+- tokens_used (counter)
+- decision_latency_ms (float)
+
+**Environment variables:**
+- ANTHROPIC_API_KEY
+- INFLUXDB_URL=http://influxdb:8086
+- **INFLUXDB_TOKEN=my-super-secret-auth-token** (CRITICAL: Direct token, NOT file)
+- INFLUXDB_ORG=monitoring
+- INFLUXDB_BUCKET=agent_metrics
+- RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER, RABBITMQ_PASS
+- PUBLISHER_ID (publisher-1 or publisher-2)
+- DRY_RUN (true/false - if true, use mock AI responses)
+- MAX_TOKENS (default: 300)
+- DECISION_INTERVAL_SECONDS (default: 60)
+
+**Python Implementation Note:**
+```python
+# CRITICAL: Read token from environment (NOT file)
+token = os.getenv('INFLUXDB_TOKEN')
+if not token:
+    raise RuntimeError("INFLUXDB_TOKEN environment variable not set")
+```
+
+### Agent 3: AI Consumer Agents with Vector DB Memory (2 replicas - consumer-1, consumer-2)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK + qdrant-client + sentence-transformers
+
+**NEW: Vector DB Integration**
+- Connects to Qdrant on startup
+- Uses Sentence Transformers model: 'all-MiniLM-L6-v2' (384 dimensions, runs locally)
+- Stores processed messages as embeddings
+- Searches for similar past messages before making decisions
+- Builds semantic memory over time
+
+**COST CONTROL:**
+- Ask Claude for 1 in 10 messages (90% use default processing)
+- Maximum: 1 Claude API call per 30 seconds
+- Token limit: max_tokens=200
+- **NEW:** If similar past cases found with confidence > 0.85, skip Claude API and use past decision
+
+**AI Behavior with Memory:**
+
+**On receiving message:**
+1. Extract message content and context
+2. Generate embedding using Sentence Transformers (local, free)
+3. Search Qdrant for similar past messages (top 5 results)
+4. If similar cases found (score > 0.85):
+   - Use past decision (save Claude API call)
+   - Log: "Using memory instead of Claude"
+5. Else (no similar cases OR low confidence):
+   - Call Claude API with context from similar cases
+6. Store decision + embedding in Qdrant for future reference
+
+**Vector DB Storage Format:**
+```python
+{
+  "id": "message-uuid",
+  "vector": [0.123, 0.456, ...],  # 384 dimensions
+  "payload": {
+    "message_id": "abc-123",
+    "timestamp": "2026-02-04T10:15:30Z",
+    "genre": "fictional",
+    "context": "The protagonist moves...",
+    "action_taken": "process_immediately",
+    "ai_reasoning": "High priority content",
+    "consumer_id": "consumer-1",
+    "confidence": 0.95
+  }
+}
+```
+
+**Metrics to InfluxDB:**
+- messages_consumed (counter)
+- processing_duration_ms (histogram)
+- ai_decision_count (counter)
+- **NEW:** memory_hit_count (counter)
+- **NEW:** memory_miss_count (counter)
+- **NEW:** similar_cases_found (gauge)
+- **NEW:** embedding_generation_ms (histogram)
+- **NEW:** vector_search_ms (histogram)
+- **NEW:** confidence_score (gauge)
+- tokens_used (counter)
+
+**Environment variables:**
+- ANTHROPIC_API_KEY
+- INFLUXDB_URL=http://influxdb:8086
+- **INFLUXDB_TOKEN=my-super-secret-auth-token** (CRITICAL: Direct token, NOT file)
+- INFLUXDB_ORG=monitoring
+- INFLUXDB_BUCKET=agent_metrics
+- RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER, RABBITMQ_PASS
+- CONSUMER_ID (consumer-1 or consumer-2)
+- **NEW:** QDRANT_HOST=qdrant
+- **NEW:** QDRANT_PORT=6333
+- **NEW:** EMBEDDING_MODEL=all-MiniLM-L6-v2
+- **NEW:** MEMORY_CONFIDENCE_THRESHOLD=0.85
+- DRY_RUN (true/false)
+- AI_DECISION_RATE (default: 0.1 = 10% of messages)
+
+### Agent 4: AI Monitor Agent (1 instance - monitor-1)
+- Ubuntu 20.04 + Python 3 + influxdb-client + anthropic SDK
+
+**COST CONTROL:**
+- Runs every 120 seconds
+- Token limit: max_tokens=400
+
+**AI Behavior:**
+- Every 120 seconds:
+  - Query InfluxDB for metrics summary (last 5 minutes)
+  - **NEW:** Query Qdrant for vector DB stats
+  - Call Claude API for health analysis
+  - Log analysis to InfluxDB and Loki
+  - If critical: Print alert to console
+
+**Environment variables:**
+- ANTHROPIC_API_KEY
+- INFLUXDB_URL=http://influxdb:8086
+- **INFLUXDB_TOKEN=my-super-secret-auth-token** (CRITICAL: Direct token, NOT file)
+- INFLUXDB_ORG=monitoring
+- INFLUXDB_BUCKET=agent_metrics
+- **NEW:** QDRANT_HOST=qdrant
+- **NEW:** QDRANT_PORT=6333
+- AGENT_ID=monitor-1
+- DRY_RUN (true/false)
+
+### Agent 5: InfluxDB Time Series Database
+- InfluxDB 2.x on port 8086
+- Organization: "monitoring"
+- Bucket: "agent_metrics" (7 day retention for testing)
+- Admin user: admin
+- Admin password: password123
+- **Admin Token: my-super-secret-auth-token** (hardcoded for testing)
+- Stores metrics and AI reasoning
+
+**CRITICAL Token Configuration:**
+- InfluxDB initialized with `DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token`
+- This exact token MUST be used by all agents
+- Agents read token from `INFLUXDB_TOKEN` environment variable
+- **DO NOT** use token files or shared volumes for token distribution
+- Token is set during InfluxDB container initialization
+
+### Agent 6: Loki Log Aggregation System
+- Grafana Loki v2.9.0 on port 3100 (pin exact version!)
+- Stores ALL application logs from all agents
+- Retention: 7 days (for testing)
+- Accessible via Grafana
+- Uses minimal, valid configuration
+- **CRITICAL:** NO deprecated fields - the following are REMOVED in v2.9+:
+  - `enforce_metric_name` (removed from limits_config)
+  - `max_look_back_period` (removed from chunk_store_config)
+  - `shared_store` (removed from compactor)
+
+
+### Agent 7: Promtail Log Collector
+- Grafana Promtail v2.9.0 (pin exact version to match Loki!)
+- Collects logs from Docker containers
+- Labels logs with: agent_id, agent_type, level
+- Ships to Loki
+
+### Agent 8: Qdrant Vector Database (NEW!)
+- Qdrant latest version
+- Port 6333 (REST API)
+- Port 6334 (gRPC)
+- Persistent storage via Docker volume
+
+**Purpose:**
+- Store message embeddings for semantic search
+- Enable agent memory and learning
+- Support similarity search
+
+**Collections:**
+```
+book_messages:
+  - vectors: 384 dimensions (all-MiniLM-L6-v2)
+  - distance: Cosine
+  - payload: message metadata + decisions
+```
+
+### Agent 9: Grafana Dashboard
+- Grafana latest on port 3000
+- Pre-configured dashboards for:
+  - Agent metrics
+  - AI decisions
+  - Memory hit rates
+  - Queue depths
+- Data sources: InfluxDB + Loki
+
+---
+
+## Docker Compose Structure
+
+**⚠️ CRITICAL YAML SYNTAX NOTES:**
+1. `depends_on` with conditions must use mapping syntax (key: value), NOT list syntax
+2. Loki healthcheck must use port 3100 (NOT 6333 which is Qdrant)
+3. Pin Loki/Promtail versions to 2.9.0
+
+```yaml
+version: '3.8'
+
+services:
+  # Infrastructure
+  # Add restart: unless-stopped to all services for auto-restart after crashes
+  influxdb:
+    image: influxdb:2.7
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=password123
+      - DOCKER_INFLUXDB_INIT_ORG=monitoring
+      - DOCKER_INFLUXDB_INIT_BUCKET=agent_metrics
+      - DOCKER_INFLUXDB_INIT_RETENTION=168h
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-network
+  
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-network
+  
+  loki:
+    image: grafana/loki:2.9.0
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      # CRITICAL: Use port 3100 (Loki), NOT 6333 (that's Qdrant!)
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-network
+  
+  promtail:
+    image: grafana/promtail:2.9.0
+    restart: unless-stopped
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./promtail-config.yaml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-network
+  
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-simple-json-datasource
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  # Setup jobs
+  influxdb-setup:
+    image: python:3.9-slim
+    volumes:
+      - ./setup-influxdb.py:/setup.py
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=monitoring
+      - INFLUXDB_BUCKET=agent_metrics
+    command: >
+      bash -c "
+        pip install --quiet influxdb-client &&
+        python /setup.py
+      "
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  rabbitmq-setup:
+    image: python:3.9-slim
+    volumes:
+      - ./setup-rabbitmq.py:/setup.py
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+    command: >
+      bash -c "
+        pip install --quiet pika &&
+        python /setup.py
+      "
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  # AI Agents
+  # CRITICAL: Note the correct depends_on syntax - mapping style with conditions
+  # CRITICAL: Add restart: unless-stopped to all services so they auto-restart after crashes
+  publisher-1:
+    build: ./publisher
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PUBLISHER_ID=publisher-1
+      - DRY_RUN=${DRY_RUN:-false}
+      - DECISION_INTERVAL_SECONDS=60
+      - MAX_TOKENS=300
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=monitoring
+      - INFLUXDB_BUCKET=agent_metrics
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+    depends_on:
+      influxdb-setup:
+        condition: service_completed_successfully
+      rabbitmq-setup:
+        condition: service_completed_successfully
+      loki:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  publisher-2:
+    build: ./publisher
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PUBLISHER_ID=publisher-2
+      - DRY_RUN=${DRY_RUN:-false}
+      - DECISION_INTERVAL_SECONDS=60
+      - MAX_TOKENS=300
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=monitoring
+      - INFLUXDB_BUCKET=agent_metrics
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+    depends_on:
+      influxdb-setup:
+        condition: service_completed_successfully
+      rabbitmq-setup:
+        condition: service_completed_successfully
+      loki:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  consumer-1:
+    build: ./consumer
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CONSUMER_ID=consumer-1
+      - DRY_RUN=${DRY_RUN:-false}
+      - AI_DECISION_RATE=0.1
+      - MAX_TOKENS=200
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=monitoring
+      - INFLUXDB_BUCKET=agent_metrics
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - MEMORY_CONFIDENCE_THRESHOLD=0.85
+      # Memory optimization for sentence-transformers
+      - TOKENIZERS_PARALLELISM=false
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    depends_on:
+      influxdb-setup:
+        condition: service_completed_successfully
+      rabbitmq-setup:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  consumer-2:
+    build: ./consumer
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CONSUMER_ID=consumer-2
+      - DRY_RUN=${DRY_RUN:-false}
+      - AI_DECISION_RATE=0.1
+      - MAX_TOKENS=200
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=monitoring
+      - INFLUXDB_BUCKET=agent_metrics
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - MEMORY_CONFIDENCE_THRESHOLD=0.85
+      # Memory optimization for sentence-transformers
+      - TOKENIZERS_PARALLELISM=false
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    depends_on:
+      influxdb-setup:
+        condition: service_completed_successfully
+      rabbitmq-setup:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    networks:
+      - agent-network
+  
+  monitor:
+    build: ./monitor
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - AGENT_ID=monitor-1
+      - DRY_RUN=${DRY_RUN:-false}
+      - CHECK_INTERVAL_SECONDS=120
+      - MAX_TOKENS=400
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=monitoring
+      - INFLUXDB_BUCKET=agent_metrics
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+    depends_on:
+      influxdb-setup:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    networks:
+      - agent-network
+
+volumes:
+  influxdb-data:
+  rabbitmq-data:
+  loki-data:
+  grafana-data:
+  qdrant-storage:
+
+networks:
+  agent-network:
+    driver: bridge
+```
+
+---
+
+## Python Requirements
+
+**Publisher requirements.txt:**
+```
+anthropic>=0.40.0
+influxdb-client>=1.40.0
+pika>=1.3.0
+```
+
+**Consumer requirements.txt:**
+```
+anthropic>=0.40.0
+influxdb-client>=1.40.0
+pika>=1.3.0
+qdrant-client>=1.7.0
+# Use CPU-only torch to reduce memory footprint and avoid segfaults
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+sentence-transformers>=2.2.0,<3.0.0
+transformers>=4.30.0,<5.0.0
+numpy>=1.24.0,<2.0.0
+```
+
+**IMPORTANT: Consumer Dockerfile must also be updated to handle memory:**
+```dockerfile
+FROM python:3.10-slim
+
+# Reduce memory usage
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+ENV TOKENIZERS_PARALLELISM=false
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+
+WORKDIR /app
+COPY requirements.txt .
+
+# Install CPU-only torch first, then other dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download the model during build (not at runtime)
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+COPY consumer.py .
+CMD ["python3", "-u", "consumer.py"]
+```
+
+**Monitor requirements.txt:**
+```
+anthropic>=0.40.0
+influxdb-client>=1.40.0
+qdrant-client>=1.7.0
+```
+
+---
+
+## Key Implementation Notes
+
+1. **Logging**: JSON to stdout (picked up by Promtail/Loki)
+
+2. **InfluxDB Token - CRITICAL**:
+   - Set in docker-compose: `INFLUXDB_TOKEN=my-super-secret-auth-token`
+   - InfluxDB initialized with: `DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token`
+   - Python code reads: `token = os.getenv('INFLUXDB_TOKEN')`
+   - **DO NOT** use `/shared/influxdb-token.txt` files
+   - **DO NOT** use `INFLUXDB_TOKEN_FILE` environment variable
+   - If token not found, raise `RuntimeError("INFLUXDB_TOKEN not set")`
+   - **ALWAYS cast field values explicitly** to avoid type conflicts:
+     ```python
+     point.field("duration_ms", float(value))  # Always float
+     point.field("count", int(value))          # Always int
+     ```
+
+3. **Embeddings**: Use sentence-transformers `model.encode()` locally (free, no API)
+
+4. **Error handling**: Retry with exponential backoff, fall back to defaults
+
+5. **DRY_RUN**: If true, use mock Claude responses (for testing without API costs)
+
+6. **Qdrant Collection**: Auto-create on first consumer startup if not exists
+
+7. **Qdrant API (CRITICAL for qdrant-client >= 1.7)**:
+   - Use `query_points()` NOT `search()` - the old method was removed
+   - Use `upsert()` to store vectors
+   ```python
+   # Searching for similar vectors:
+   results = client.query_points(
+       collection_name="book_messages",
+       query=embedding,  # The vector (list of floats)
+       limit=5,
+       with_payload=True
+   ).points
+   
+   for point in results:
+       similarity_score = point.score
+       data = point.payload
+   
+   # Storing vectors:
+   from qdrant_client.models import PointStruct
+   
+   client.upsert(
+       collection_name="book_messages",
+       points=[
+           PointStruct(
+               id=str(uuid.uuid4()),
+               vector=embedding,
+               payload={"message_id": "...", "action": "..."}
+           )
+       ]
+   )
+   ```
+
+---
+
+## Estimated Costs
+
+**With Vector DB Memory (85% hit rate):**
+- Publishers: 120 calls/hour (unchanged)
+- Consumers: ~2 calls/hour (only 15% misses)
+- Total: ~122 calls/hour = ~$0.40/hour
+
+**Savings**: ~$0.05/hour = ~$36/month  
+**Plus**: Agents get smarter over time!
+
+---
+
+## Success Criteria
+
+After 10 minutes of running:
+
+✅ All containers healthy  
+✅ Qdrant has vectors stored  
+✅ Consumer logs show "MEMORY_HIT" events  
+✅ Grafana shows memory hit rate > 0  
+✅ Token usage decreasing as memory grows  
+✅ No InfluxDB token errors in logs  
+
+---
+
+## FILES TO GENERATE - COMPLETE LIST
+
+**CRITICAL: All Python files must have COMPLETE implementations**
+
+1. **docker-compose.yml**
+   - InfluxDB with `DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token`
+   - All agents with `INFLUXDB_TOKEN=my-super-secret-auth-token`
+   - **NO** `INFLUXDB_TOKEN_FILE` references
+   - **NO** `shared-data` volumes for token distribution
+   - Healthchecks for influxdb, rabbitmq, qdrant, loki
+   - Proper `depends_on` with `condition: service_healthy` or `condition: service_completed_successfully`
+   - **CRITICAL:** Use mapping syntax for depends_on with conditions (see example above)
+
+2. **setup-influxdb.py**
+   - Wait for InfluxDB healthy
+   - Verify bucket exists
+   - **DO NOT** create or write token files
+   - Use token from `os.getenv('INFLUXDB_TOKEN')`
+
+3. **setup-rabbitmq.py**
+   - Create exchange "books"
+   - Create queues "fictional", "non-fictional"
+   - Bind queues to exchange
+   - **MUST complete successfully before publishers start**
+
+4. **publisher/Dockerfile**
+   - FROM python:3.10-slim
+   - Install dependencies
+   - COPY publisher.py
+   - CMD ["python3", "publisher.py"]
+
+5. **publisher/publisher.py**
+   - **CRITICAL**: Read token with `token = os.getenv('INFLUXDB_TOKEN')`
+   - Raise error if token not set
+   - Complete InfluxDB connection logic
+   - Complete RabbitMQ publishing logic (publish to 'books' exchange)
+   - Complete Claude API decision logic
+   - Structured JSON logging
+
+6. **publisher/requirements.txt** (as specified above)
+
+7. **consumer/Dockerfile**
+   - FROM python:3.10-slim
+   - Install dependencies
+   - Pre-download sentence-transformers model during build
+   - COPY consumer.py
+   - CMD ["python3", "consumer.py"]
+
+8. **consumer/consumer.py**
+   - **CRITICAL**: Same token handling as publisher
+   - Complete Qdrant integration (auto-create collection if not exists)
+   - Complete sentence-transformers embedding generation
+   - Vector similarity search
+   - Memory-based decision making
+
+9. **consumer/requirements.txt** (as specified above)
+
+10. **monitor/Dockerfile**
+    - FROM python:3.10-slim
+    - Install dependencies
+    - COPY monitor.py
+    - CMD ["python3", "monitor.py"]
+
+11. **monitor/monitor.py**
+    - **CRITICAL**: Same token handling as publisher
+    - Query InfluxDB for metrics
+    - Query Qdrant for stats
+    - Claude API health analysis
+
+12. **monitor/requirements.txt** (as specified above)
+
+13. **loki-config.yaml**
+    - Use ONLY valid fields for Loki v2.9+
+    - **NO** deprecated `max_look_back_period` field
+    - **NO** deprecated `shared_store` field under compactor
+    - **NO** deprecated `enforce_metric_name` field under limits_config
+    - Use `compactor.delete_request_store` instead of `shared_store`
+    - Valid `storage_config` with `filesystem` and `boltdb_shipper`
+    - **WORKING** reference implementation:
+    ```yaml
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 9096
+      log_level: info
+
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+
+    ingester:
+      wal:
+        enabled: true
+        dir: /loki/wal
+      lifecycler:
+        ring:
+          kvstore:
+            store: inmemory
+          replication_factor: 1
+        final_sleep: 0s
+      chunk_idle_period: 3m
+      max_chunk_age: 1h
+      chunk_target_size: 1048576
+      chunk_retain_period: 30s
+
+    schema_config:
+      configs:
+        - from: 2020-10-24
+          store: boltdb-shipper
+          object_store: filesystem
+          schema: v11
+          index:
+            prefix: index_
+            period: 24h
+
+    storage_config:
+      filesystem:
+        directory: /loki/chunks
+      boltdb_shipper:
+        active_index_directory: /loki/boltdb-shipper-active
+        cache_location: /loki/boltdb-shipper-cache
+        cache_ttl: 24h
+
+    limits_config:
+      # NOTE: enforce_metric_name is REMOVED - do not include it!
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      ingestion_rate_mb: 10
+      ingestion_burst_size_mb: 20
+      max_streams_per_user: 10000
+      max_entries_limit_per_query: 5000
+
+    compactor:
+      working_directory: /loki/compactor
+      compaction_interval: 10m
+      retention_enabled: true
+      retention_delete_delay: 2h
+      retention_delete_worker_count: 150
+      # NOTE: Use delete_request_store instead of deprecated shared_store
+      delete_request_store: filesystem
+
+    table_manager:
+      retention_deletes_enabled: true
+      retention_period: 168h
+
+    query_range:
+      results_cache:
+        cache:
+          embedded_cache:
+            enabled: true
+            max_size_mb: 100
+
+    analytics:
+      reporting_enabled: false
+    ```
+
+14. **promtail-config.yaml**
+    - **CRITICAL:** Must always apply at least one label to every log stream
+    - **DO NOT** use `action: keep` filters that might exclude all containers
+    - Always set `container` label from `__meta_docker_container_name`
+    - **WORKING** reference implementation:
+    ```yaml
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+
+    positions:
+      filename: /tmp/positions.yaml
+
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+        batchwait: 1s
+        batchsize: 1048576
+        timeout: 10s
+
+    scrape_configs:
+      # Scrape ALL container logs
+      - job_name: containers
+        docker_sd_configs:
+          - host: unix:///var/run/docker.sock
+            refresh_interval: 5s
+        relabel_configs:
+          # CRITICAL: Always add container label (Loki requires at least one label!)
+          - source_labels: ['__meta_docker_container_name']
+            regex: '/(.*)'
+            target_label: container
+          
+          # Extract service name from container name
+          - source_labels: ['__meta_docker_container_name']
+            regex: '/([^_-]+).*'
+            target_label: service
+          
+          # Add job label
+          - target_label: job
+            replacement: docker
+        
+        pipeline_stages:
+          # Try to parse JSON logs from agents
+          - json:
+              expressions:
+                level: level
+                message: message
+                agent_id: agent_id
+                agent_type: agent_type
+          
+          # Add extracted fields as labels (if they exist)
+          - labels:
+              level:
+              agent_id:
+              agent_type:
+          
+          # Set timestamp from log entry if available
+          - timestamp:
+              source: timestamp
+              format: RFC3339Nano
+              fallback_formats:
+                - RFC3339
+                - UnixMs
+          
+          # Output the message field if it exists, otherwise full line
+          - output:
+              source: message
+    ```
+
+15. **grafana/provisioning/datasources/datasources.yaml**
+    - Configures InfluxDB and Loki as data sources
+    - **CRITICAL:** Must include `uid` field that matches dashboard JSON references
+    - **DO NOT** use `derivedFields` with cross-datasource references - causes circular dependency errors
+    - **WORKING** reference implementation:
+    ```yaml
+    apiVersion: 1
+
+    datasources:
+      # InfluxDB for metrics
+      - name: InfluxDB
+        type: influxdb
+        uid: influxdb
+        access: proxy
+        url: http://influxdb:8086
+        jsonData:
+          version: Flux
+          organization: monitoring
+          defaultBucket: agent_metrics
+        secureJsonData:
+          token: my-super-secret-auth-token
+        isDefault: true
+        editable: true
+
+      # Loki for logs
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki:3100
+        jsonData:
+          maxLines: 1000
+        isDefault: false
+        editable: true
+    ```
+
+16. **grafana/provisioning/dashboards/dashboards.yaml**
+    - Tells Grafana where to find dashboard JSON files
+    - **WORKING** reference implementation:
+    ```yaml
+    apiVersion: 1
+
+    providers:
+      - name: 'AI Agents Dashboards'
+        orgId: 1
+        folder: 'AI Agents'
+        folderUid: 'ai-agents'
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /etc/grafana/provisioning/dashboards
+    ```
+
+17. **grafana/provisioning/dashboards/agent-dashboard.json**
+    - The actual dashboard definition
+    - **WORKING** reference implementation:
+    ```json
+    {
+      "annotations": {
+        "list": []
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 0,
+      "id": null,
+      "links": [],
+      "liveNow": false,
+      "panels": [
+        {
+          "title": "Messages Published (per minute)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+          "targets": [
+            {
+              "query": "from(bucket: \"agent_metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"publisher_metrics\")\n  |> filter(fn: (r) => r._field == \"messages_published\")\n  |> aggregateWindow(every: 1m, fn: sum, createEmpty: false)",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Messages Consumed (per minute)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+          "targets": [
+            {
+              "query": "from(bucket: \"agent_metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"consumer_metrics\")\n  |> filter(fn: (r) => r._field == \"messages_consumed\")\n  |> aggregateWindow(every: 1m, fn: sum, createEmpty: false)",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Memory Hits vs Misses",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+          "targets": [
+            {
+              "query": "from(bucket: \"agent_metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"consumer_metrics\")\n  |> filter(fn: (r) => r._field == \"memory_hit\" or r._field == \"memory_miss\")\n  |> aggregateWindow(every: 1m, fn: sum, createEmpty: false)",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "AI Tokens Used",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+          "targets": [
+            {
+              "query": "from(bucket: \"agent_metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._field == \"tokens_used\")\n  |> sum()",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Agent Logs",
+          "type": "logs",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+          "targets": [
+            {
+              "expr": "{job=\"containers\"} |= ``",
+              "refId": "A"
+            }
+          ]
+        }
+      ],
+      "refresh": "5s",
+      "schemaVersion": 38,
+      "style": "dark",
+      "tags": ["ai-agents", "multi-agent"],
+      "templating": {
+        "list": []
+      },
+      "time": {
+        "from": "now-15m",
+        "to": "now"
+      },
+      "title": "AI Multi-Agent System",
+      "uid": "ai-agents-main",
+      "version": 1
+    }
+    ```
+
+---
+
+## VERIFICATION CHECKLIST
+
+After generation, verify these in generated files:
+
+✅ `docker-compose.yml` has `DOCKER_INFLUXDB_INIT_ADMIN_TOKEN` in influxdb service  
+✅ `docker-compose.yml` has `INFLUXDB_TOKEN=my-super-secret-auth-token` in ALL agent services  
+✅ `docker-compose.yml` uses correct `depends_on` mapping syntax (NOT list with nested conditions)  
+✅ `docker-compose.yml` loki healthcheck uses port 3100 (NOT 6333)  
+✅ **NO** `INFLUXDB_TOKEN_FILE` anywhere in docker-compose.yml  
+✅ **NO** `/shared/influxdb-token.txt` references in docker-compose.yml  
+✅ **NO** `shared-data` volumes in publisher/consumer/monitor  
+✅ `publisher.py` reads: `token = os.getenv('INFLUXDB_TOKEN')`  
+✅ `consumer.py` reads: `token = os.getenv('INFLUXDB_TOKEN')`  
+✅ `monitor.py` reads: `token = os.getenv('INFLUXDB_TOKEN')`  
+✅ `setup-influxdb.py` does **NOT** write token files  
+✅ `loki-config.yaml` does **NOT** contain `max_look_back_period`  
+✅ `loki-config.yaml` does **NOT** contain `shared_store`  
+✅ `loki-config.yaml` does **NOT** contain `enforce_metric_name`  
+✅ `loki-config.yaml` uses `delete_request_store: filesystem` in compactor  
+✅ `docker-compose.yml` loki service uses image `grafana/loki:2.9.0` (pinned version)  
+✅ `docker-compose.yml` promtail service uses image `grafana/promtail:2.9.0` (pinned version)  
+✅ `promtail-config.yaml` always applies `container` label to all log streams  
+✅ `promtail-config.yaml` does NOT use `action: keep` that might exclude containers  
+✅ All Python files use valid Claude model names (e.g., `claude-sonnet-4-20250514`)  
+✅ **NO** old model names like `claude-3-5-sonnet-20241022` or `claude-3-opus-20240229`  
+✅ All Python files are COMPLETE (no TODOs, no truncation)  
+✅ Consumer requirements.txt uses CPU-only torch (`torch==2.6.0+cpu`)  
+✅ Consumer Dockerfile pre-downloads the embedding model during build  
+✅ Consumer services have `TOKENIZERS_PARALLELISM=false` environment variable  
+✅ Consumer services have memory limits in docker-compose (`deploy.resources.limits.memory`)  
+✅ Consumer uses `client.query_points()` NOT `client.search()` for Qdrant searches  
+✅ All InfluxDB field writes explicitly cast types: `float(value)` or `int(value)`  
+✅ `grafana/provisioning/datasources/datasources.yaml` exists with InfluxDB and Loki configured  
+✅ `grafana/provisioning/datasources/datasources.yaml` has `uid: influxdb` and `uid: loki` fields  
+✅ `grafana/provisioning/datasources/datasources.yaml` does NOT use `derivedFields` with cross-datasource references  
+✅ `grafana/provisioning/dashboards/dashboards.yaml` exists with provider configuration  
+✅ At least one dashboard JSON file exists in `grafana/provisioning/dashboards/`  
+✅ All services have `restart: unless-stopped` for auto-restart after crashes  
+
+---
+
+## COMMON ERRORS AND FIXES
+
+### Error: `field enforce_metric_name not found in type validation.plain`
+**Cause:** Using deprecated `enforce_metric_name` in loki-config.yaml  
+**Fix:** Remove `enforce_metric_name` from `limits_config` section entirely
+
+### Error: `field max_look_back_period not found in type config.ChunkStoreConfig`
+**Cause:** Using deprecated `max_look_back_period` in loki-config.yaml  
+**Fix:** Remove entire `chunk_store_config` section
+
+### Error: `field shared_store not found in type compactor.Config`
+**Cause:** Using deprecated `shared_store` in compactor section  
+**Fix:** Replace with `delete_request_store: filesystem`
+
+### Error: `no exchange 'books' in vhost '/'`
+**Cause:** Publishers starting before rabbitmq-setup completes  
+**Fix:** Use `depends_on` with `condition: service_completed_successfully` for rabbitmq-setup
+
+### Error: `Channel is closed`
+**Cause:** RabbitMQ channel closed due to missing exchange  
+**Fix:** Ensure rabbitmq-setup creates the 'books' exchange before publishers start
+
+### Error: Invalid YAML in docker-compose.yml
+**Cause:** Mixing list syntax (`- service`) with mapping conditions  
+**Fix:** Use proper mapping syntax:
+```yaml
+# WRONG:
+depends_on:
+  - influxdb-setup
+    - condition: service_completed_successfully
+
+# CORRECT:
+depends_on:
+  influxdb-setup:
+    condition: service_completed_successfully
+```
+
+### Error: `error at least one label pair is required per stream`
+**Cause:** Promtail not applying any labels to log streams  
+**Fix:** Ensure `promtail-config.yaml` always sets at least one label (like `container`). Remove any `action: keep` regex filters that might exclude all containers. Use the reference implementation above.
+
+### Error: `Error code: 404 - model: claude-3-5-sonnet-20241022`
+**Cause:** Using an outdated/invalid Claude model name  
+**Fix:** Use current model names:
+```python
+# WRONG - these models no longer exist:
+model="claude-3-5-sonnet-20241022"
+model="claude-3-opus-20240229"
+model="claude-3-haiku-20240307"
+
+# CORRECT - use these model names:
+model="claude-sonnet-4-20250514"      # Recommended
+model="claude-opus-4-5-20251101"      # Most advanced
+model="claude-sonnet-4-5-20250929"    # Latest Sonnet
+model="claude-haiku-4-5-20251001"     # Fastest/cheapest
+```
+
+### Error: `consumer exited with code 139` (Segmentation Fault)
+**Cause:** Memory issues or incompatible PyTorch/numpy versions with sentence-transformers  
+**Fix:** 
+1. Use CPU-only torch in requirements.txt:
+   ```
+   --extra-index-url https://download.pytorch.org/whl/cpu
+   torch==2.6.0+cpu
+   ```
+2. Add memory-reducing environment variables to Dockerfile:
+   ```dockerfile
+   ENV TOKENIZERS_PARALLELISM=false
+   ENV OMP_NUM_THREADS=1
+   ENV MKL_NUM_THREADS=1
+   ```
+3. Pre-download embedding model in Dockerfile (not at runtime):
+   ```dockerfile
+   RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+   ```
+4. Add memory limits to docker-compose.yml:
+   ```yaml
+   consumer-1:
+     deploy:
+       resources:
+         limits:
+           memory: 2G
+   ```
+
+### Error: `'QdrantClient' object has no attribute 'search'`
+**Cause:** Using old Qdrant API. The `search()` method was replaced in qdrant-client >= 1.7  
+**Fix:** Use `query_points()` instead of `search()`:
+```python
+# OLD (broken) - search() no longer exists:
+results = client.search(
+    collection_name="book_messages",
+    query_vector=embedding,
+    limit=5
+)
+
+# NEW (correct for qdrant-client >= 1.7):
+results = client.query_points(
+    collection_name="book_messages",
+    query=embedding,  # Note: 'query' not 'query_vector'
+    limit=5,
+    with_payload=True
+).points
+
+# Accessing results:
+for point in results:
+    score = point.score
+    payload = point.payload
+```
+
+### Error: `field type conflict: input field "X" is type float, already exists as type integer`
+**Cause:** InfluxDB field types are set on first write and cannot change. If you first wrote an integer and later try to write a float, it fails.  
+**Fix:** 
+1. Always explicitly cast numeric fields in Python code:
+   ```python
+   # Ensure consistent types when writing to InfluxDB
+   point.field("decision_latency_ms", float(duration_ms))
+   point.field("tokens_used", int(tokens))
+   point.field("confidence_score", float(score))
+   ```
+2. Delete existing measurement data to reset schema:
+   ```bash
+   docker-compose exec influxdb influx delete \
+     --bucket agent_metrics \
+     --org monitoring \
+     --predicate '_measurement="monitor_analysis"' \
+     --start 1970-01-01T00:00:00Z \
+     --stop 2030-01-01T00:00:00Z \
+     --token my-super-secret-auth-token
+   ```
+3. Or delete the entire InfluxDB volume and restart:
+   ```bash
+   docker-compose down
+   docker volume rm <project>_influxdb-data
+   docker-compose up -d
+   ```
+
+### Problem: Grafana shows no custom dashboards
+**Cause:** Missing or incorrectly configured provisioning files  
+**Fix:** Create the required provisioning structure:
+```
+grafana/
+  provisioning/
+    datasources/
+      datasources.yaml     # Configures InfluxDB + Loki connections
+    dashboards/
+      dashboards.yaml      # Tells Grafana where to find JSON dashboards
+      agent-dashboard.json # The actual dashboard definition
+```
+
+Required files:
+1. `datasources.yaml` - must include InfluxDB with Flux query language and correct token
+2. `dashboards.yaml` - must point to the correct path (`/etc/grafana/provisioning/dashboards`)
+3. At least one `.json` dashboard file in the dashboards folder
+
+After adding files, restart Grafana:
+```bash
+docker-compose restart grafana
+```
+
+### Problem: Grafana dashboards exist but show "No data" or datasource errors
+**Cause:** Datasource `uid` mismatch - dashboards reference a uid that doesn't exist  
+**Fix:** Add explicit `uid` fields to `datasources.yaml` that match what dashboards expect:
+```yaml
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    uid: influxdb          # ← CRITICAL: Must match dashboard JSON references
+    ...
+  - name: Loki
+    type: loki
+    uid: loki              # ← CRITICAL: Must match dashboard JSON references
+    ...
+```
+Check what uid your dashboards expect:
+```bash
+grep -r '"uid"' grafana/provisioning/dashboards/*.json | head -5
+```
+Then restart Grafana:
+```bash
+docker-compose restart grafana
+```
+
+### Error: `Datasource provisioning error: data source not found`
+**Cause:** Using `derivedFields` in Loki datasource that references another datasource (like InfluxDB) - creates circular dependency  
+**Fix:** Remove `derivedFields` section from Loki datasource in `datasources.yaml`:
+```yaml
+# WRONG - causes circular dependency error:
+- name: Loki
+  type: loki
+  jsonData:
+    derivedFields:
+      - datasourceUid: influxdb    # ← This breaks provisioning!
+        matcherRegex: "..."
+
+# CORRECT - simple config without derivedFields:
+- name: Loki
+  type: loki
+  uid: loki
+  access: proxy
+  url: http://loki:3100
+  jsonData:
+    maxLines: 1000
+  isDefault: false
+  editable: true
+```
+After fixing, clear Grafana state and restart:
+```bash
+docker-compose down
+docker volume rm <project>_grafana-data
+docker-compose up -d
+```
+
+### Problem: Services don't restart after crashing (e.g., consumer exit code 139)
+**Cause:** Docker containers don't restart by default when they crash  
+**Fix:** Add `restart: unless-stopped` to all services in `docker-compose.yml`:
+```yaml
+services:
+  consumer-1:
+    build: ./consumer
+    restart: unless-stopped    # ← ADD THIS
+    ...
+  
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped    # ← ADD THIS
+    ...
+
+  monitor:
+    container_name: monitor-1
+    restart: unless-stopped    # ← ADD THIS
+    ...
+```
+Restart policy options:
+- `no` - Never restart (default)
+- `always` - Always restart, even after reboot
+- `unless-stopped` - Restart unless manually stopped (recommended)
+- `on-failure` - Only restart if exit code != 0
+
+---
+
+This spec includes EVERYTHING: AI agents, vector DB memory, semantic search, cost savings tracking, full observability, and PROPER configuration for all services!
