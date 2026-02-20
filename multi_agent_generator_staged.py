@@ -289,6 +289,10 @@ Start your response with the FIRST LINE of the file.
             full_path = output_path / filepath
             full_path.parent.mkdir(parents=True, exist_ok=True)
             
+            # Fix: convert dict to string if needed
+            if isinstance(content, dict):
+                content = json.dumps(content, indent=2)
+            
             with open(full_path, 'w') as f:
                 f.write(content)
         
