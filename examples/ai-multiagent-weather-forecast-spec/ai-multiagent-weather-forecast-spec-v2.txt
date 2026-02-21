@@ -1,0 +1,1059 @@
+# Specification: Weather-Forge Event-Driven Pipeline v2.2
+
+## Overview
+Create an event-driven weather monitoring system that demonstrates Kafka streaming, AI-driven adaptive processing, and production-grade observability. The system fetches real-time weather data for Canadian cities, routes messages through Kafka based on weather conditions, and persists metrics to a time-series database for visualization.
+
+This is a **self-evolving multi-agent system** where:
+- Agents run independently in Docker containers
+- Publisher uses **Claude API** for adaptive batching decisions (cost-optimized)
+- Cities list is **externally configurable** (no code changes needed)
+- Full Kafka cluster monitoring (leader elections, ISR, lag)
+- Alerting via Alertmanager when things break
+- Dead letter queue for failed message handling
+- Log aggregation via Loki
+
+## CRITICAL: Port Assignments (No Conflicts)
+
+**IMPORTANT: Verify these port assignments before generating docker-compose.yml**
+
+| Service | Internal Port | External Port | Notes |
+|---------|---------------|---------------|-------|
+| Kafka | 9092 | 9092 | Broker |
+| Kafka Controller | 9093 | 9093 | Internal only |
+| Kafka-UI | 8080 | 8080 | |
+| Kafka-Exporter | 9308 | 9308 | |
+| InfluxDB | 8086 | 8086 | |
+| Prometheus | 9090 | 9090 | |
+| **Alertmanager** | **9093** | **9094** | **External 9094 to avoid conflict with Kafka Controller** |
+| Grafana | 3000 | 3000 | |
+| Loki | 3100 | 3100 | |
+| Publisher | 8180 | 8180 | |
+| Consumer | 8181 | 8181 | |
+
+## System Architecture (12 Agent Types)
+
+### Agent 1: Kafka Message Broker
+- Docker container running Apache Kafka in KRaft mode (no Zookeeper)
+- Image: apache/kafka:latest
+- Topics: 
+  - "weather-ambient" (normal weather, 3 partitions)
+  - "weather-extreme" (extreme weather, 3 partitions)
+  - "weather-dlq" (dead letter queue for failed messages, 1 partition)
+- Ports: 9092 (Kafka), 9093 (Controller) - INTERNAL ONLY for 9093
+- Volumes: kafka-data:/var/lib/kafka/data (persistent storage)
+- Purpose: Central message routing with conditional topic selection
+
+### Agent 2: Weather Publisher Agent (AI-Enabled)
+- Ubuntu 22.04 based Docker image with Python 3.11
+- Fetches weather data from Open-Meteo public API (no API key required)
+- **Cities loaded from external JSON config file** (not hardcoded)
+
+- **Default Cities (configurable via configs/cities.json):**
+  - Port Coquitlam, BC (49.26, -122.78)
+  - Vancouver, BC (49.28, -123.12)
+  - Toronto, ON (43.65, -79.38)
+  - Montreal, QC (45.50, -73.57)
+  - Calgary, AB (51.05, -114.07)
+  - Edmonton, AB (53.55, -113.49)
+  - Ottawa, ON (45.42, -75.70)
+  - Winnipeg, MB (49.90, -97.14)
+  - Halifax, NS (44.65, -63.58)
+  - Whitehorse, YT (60.72, -135.05)
+
+- **Behavior:**
+  - On startup: Load cities from CITIES_CONFIG_PATH
+  - Every 60 seconds: Iterate through all cities
+  - Fetch `temperature_2m` and `wind_speed_10m` from Open-Meteo API
+  - Apply routing logic:
+    - If wind_speed > 40 km/h OR temperature < -10°C → publish to "weather-extreme"
+    - Otherwise → publish to "weather-ambient"
+  - Log each publish with `[Weather-Forge:Publisher]` prefix
+
+- **AI-Driven Adaptive Batching (Cost-Optimized):**
+  - Every 15 minutes: Check variance of last 10 readings per city
+  - **Only call Claude API if variance exceeds threshold** (saves cost)
+  - If high variance → batch messages (smooth out noise)
+  - If stable → publish immediately (no AI call)
+  - Log AI decisions to InfluxDB measurement "ai_decisions"
+  - **Dry-run mode available** for testing without API calls
+
+- **Metrics to track:**
+  - messages_published_total (counter, labels: topic, city)
+  - fetch_errors_total (counter, labels: city)
+  - fetch_duration_seconds (histogram, labels: city)
+  - current_temperature (gauge, labels: city)
+  - current_wind_speed (gauge, labels: city)
+  - ai_decisions_total (counter, labels: action)
+  - ai_calls_skipped_total (counter) - when variance below threshold
+  - ai_batch_size (gauge)
+  - ai_decision_latency_ms (histogram)
+  - data_variance (gauge, labels: city)
+  - cities_loaded (gauge) - number of cities from config
+
+- **Environment variables needed:**
+  - KAFKA_BOOTSTRAP_SERVERS (default: kafka:9092)
+  - POLL_INTERVAL_SECONDS (default: 60)
+  - METRICS_PORT (default: 8180)
+  - LOG_LEVEL (default: INFO)
+  - PUBLISHER_ID (default: publisher-1)
+  - CITIES_CONFIG_PATH (default: /app/config/cities.json)
+  - ANTHROPIC_API_KEY (required for AI features, optional if dry-run)
+  - AI_ENABLED (default: true)
+  - AI_DRY_RUN (default: false) - if true, skip API calls, use default behavior
+  - AI_DECISION_INTERVAL_SECONDS (default: 900) - 15 minutes
+  - AI_VARIANCE_THRESHOLD (default: 5.0) - only call AI if variance exceeds this
+  - BATCH_SIZE_MAX (default: 10)
+
+### Agent 3: Weather Consumer Agent (1 instance)
+- Ubuntu 22.04 based Docker image with Python 3.11
+- Subscribes to "weather-ambient", "weather-extreme", and "weather-dlq" topics
+- Consumer group: "weather-consumer-group"
+
+- **Behavior:**
+  - On message received: Parse JSON into dict/dataclass
+  - Calculate 5-minute moving average for temperature (per city, in-memory)
+  - Write raw data point to InfluxDB measurement "weather_raw"
+  - Write calculated average to InfluxDB measurement "weather_avg"
+  - On processing failure: Send to "weather-dlq" topic
+  - Log each consumption with `[Weather-Forge:Consumer]` prefix
+
+- **Moving Average Calculation:**
+  - Window: 5 minutes
+  - Storage: In-memory dict with list of readings per city
+  - Thread-safe: Use threading.Lock for concurrent access
+  - Eviction: Remove readings older than 5 minutes on each calculation
+
+- **Error Handling:**
+  - Kafka disconnect: Exponential backoff retry (1s initial, 30s max, 3 attempts)
+  - InfluxDB write fail: Retry 3x with 1s delay, then send to DLQ
+  - Malformed JSON: Log error, send to DLQ, commit offset
+
+- **Metrics to track:**
+  - messages_consumed_total (counter, labels: topic, city)
+  - processing_errors_total (counter, labels: error_type)
+  - influxdb_writes_total (counter, labels: measurement)
+  - influxdb_write_errors_total (counter)
+  - moving_average_window_size (gauge, labels: city)
+  - dlq_messages_total (counter, labels: reason)
+
+- **Environment variables needed:**
+  - KAFKA_BOOTSTRAP_SERVERS (default: kafka:9092)
+  - KAFKA_CONSUMER_GROUP (default: weather-consumer-group)
+  - INFLUXDB_URL (default: http://influxdb:8086)
+  - INFLUXDB_TOKEN (required)
+  - INFLUXDB_ORG (default: weather-forge)
+  - INFLUXDB_BUCKET (default: weather_metrics)
+  - MOVING_AVG_WINDOW_MINUTES (default: 5)
+  - METRICS_PORT (default: 8181)
+  - LOG_LEVEL (default: INFO)
+  - CONSUMER_ID (default: consumer-1)
+
+### Agent 4: InfluxDB Time Series Database
+- InfluxDB 2.7 on port 8086
+- Organization: "weather-forge"
+- Bucket: "weather_metrics" (30 day retention)
+- Admin: admin / password123
+- Token: weather-forge-token
+- Volumes: influxdb-data:/var/lib/influxdb2 (persistent storage)
+- Stores all weather data, calculated averages, and AI decisions
+
+### Agent 5: Prometheus Metrics Collector
+- Prometheus v2.50.0 on port 9090
+- Scrapes:
+  - Publisher metrics from :8180/metrics
+  - Consumer metrics from :8181/metrics
+  - Kafka-exporter metrics from :9308/metrics
+  - Alertmanager metrics from :9093/metrics (internal port)
+- Scrape interval: 15 seconds
+- Retention: 15 days
+- Alert rules loaded from /etc/prometheus/alert_rules.yml
+
+### Agent 6: Grafana Visualization
+- Grafana 10.3.0 on port 3000
+- Admin: admin / admin
+- Pre-configured datasources: InfluxDB, Prometheus, Loki
+- Pre-configured dashboards (6 total)
+
+### Agent 7: Kafka-UI Browser
+- Kafka-UI on port 8080
+- Read-only access to Kafka cluster
+- View topics, messages, consumer groups
+- Purpose: Debugging and monitoring
+
+### Agent 8: Kafka Exporter
+- Image: danielqsj/kafka-exporter:latest
+- Port: 9308
+- Exposes Kafka metrics in Prometheus format
+- Purpose: Deep Kafka cluster monitoring
+
+### Agent 9: Alertmanager
+- Image: prom/alertmanager:v0.27.0
+- **Port: 9094 external → 9093 internal** (avoids conflict with Kafka Controller)
+- Receives alerts from Prometheus
+- Routes alerts to configured receivers
+
+### Agent 10: Loki Log Aggregator
+- Image: grafana/loki:2.9.0
+- Port: 3100
+- **IMPORTANT: Must run as user "0" (root) to avoid permission issues**
+- Receives logs from Promtail
+- Retention: 7 days
+
+### Agent 11: Promtail Log Collector
+- Image: grafana/promtail:2.9.0
+- Collects logs from all containers
+- Ships to Loki
+- Labels: container_name, service
+
+### Agent 12: DLQ Processor (Optional)
+- Ubuntu 22.04 based Docker image with Python 3.11
+- Subscribes to "weather-dlq" topic
+- Consumer group: "dlq-processor-group"
+
+## Cities Configuration
+
+Cities are loaded from an external JSON file, allowing changes without code modification.
+
+### Config File: configs/cities.json
+
+```json
+{
+  "cities": [
+    {"name": "Port Coquitlam", "lat": 49.26, "lng": -122.78},
+    {"name": "Vancouver", "lat": 49.28, "lng": -123.12},
+    {"name": "Toronto", "lat": 43.65, "lng": -79.38},
+    {"name": "Montreal", "lat": 45.50, "lng": -73.57},
+    {"name": "Calgary", "lat": 51.05, "lng": -114.07},
+    {"name": "Edmonton", "lat": 53.55, "lng": -113.49},
+    {"name": "Ottawa", "lat": 45.42, "lng": -75.70},
+    {"name": "Winnipeg", "lat": 49.90, "lng": -97.14},
+    {"name": "Halifax", "lat": 44.65, "lng": -63.58},
+    {"name": "Whitehorse", "lat": 60.72, "lng": -135.05}
+  ],
+  "thresholds": {
+    "extreme_wind_speed_kmh": 40,
+    "extreme_temperature_c": -10
+  }
+}
+```
+
+## Message Format
+
+All messages MUST follow this schema:
+
+```json
+{
+  "header": {
+    "message_id": "uuid-v4-string",
+    "timestamp": "2026-02-19T15:04:05Z",
+    "version": "1.0",
+    "source": "publisher-1"
+  },
+  "metadata": {
+    "city": "Port Coquitlam",
+    "condition": "ambient",
+    "trigger": "none",
+    "batch_id": "null or batch-uuid",
+    "ai_decision": "immediate or batched"
+  },
+  "payload": {
+    "temperature": 12.5,
+    "wind_speed": 10.2,
+    "coordinates": {
+      "lat": 49.26,
+      "lng": -122.78
+    }
+  }
+}
+```
+
+## InfluxDB Schema
+
+### Measurement: "weather_raw"
+```
+Tags:
+  - city: "Port Coquitlam", "Vancouver", "Toronto", etc.
+  - condition: "ambient", "extreme"
+  - trigger: "none", "high_wind", "low_temp", "both"
+
+Fields:
+  - temperature: <float> (°C)
+  - wind_speed: <float> (km/h)
+  - message_id: <string> (for tracing)
+```
+
+### Measurement: "weather_avg"
+```
+Tags:
+  - city: "Port Coquitlam", "Vancouver", "Toronto", etc.
+
+Fields:
+  - temperature_avg_5m: <float> (calculated moving average)
+  - sample_count: <int> (readings in window)
+```
+
+### Measurement: "ai_decisions"
+```
+Tags:
+  - agent_id: "publisher-1"
+  - action: "batch", "immediate", "skipped"
+  - decision_type: "variance_based"
+
+Fields:
+  - reasoning: <string>
+  - confidence: <float> (0.0-1.0)
+  - variance_score: <float>
+  - batch_size: <int>
+  - tokens_used: <int> (0 if skipped)
+  - decision_latency_ms: <float>
+  - api_called: <bool>
+```
+
+## Docker Compose Configuration
+
+```yaml
+version: '3.8'
+
+services:
+  kafka:
+    image: apache/kafka:latest
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  kafka-setup:
+    image: apache/kafka:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic weather-ambient --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic weather-extreme --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic weather-dlq --partitions 1 --replication-factor 1 &&
+        echo 'Topics created successfully'
+      "
+    restart: "no"
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    command: --kafka.server=kafka:9092
+    ports:
+      - "9308:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: password123
+      DOCKER_INFLUXDB_INIT_ORG: weather-forge
+      DOCKER_INFLUXDB_INIT_BUCKET: weather_metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: weather-forge-token
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  loki:
+    image: grafana/loki:2.9.0
+    user: "0"
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml
+      - loki-data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yaml
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - kafka-exporter
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    ports:
+      - "9094:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - influxdb
+      - prometheus
+      - loki
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: weather-forge
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  publisher:
+    build: ./publisher
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POLL_INTERVAL_SECONDS: "60"
+      METRICS_PORT: "8180"
+      LOG_LEVEL: INFO
+      PUBLISHER_ID: publisher-1
+      CITIES_CONFIG_PATH: /app/config/cities.json
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      AI_ENABLED: "true"
+      AI_DRY_RUN: "false"
+      AI_DECISION_INTERVAL_SECONDS: "900"
+      AI_VARIANCE_THRESHOLD: "5.0"
+      BATCH_SIZE_MAX: "10"
+    volumes:
+      - ./configs:/app/config:ro
+    ports:
+      - "8180:8180"
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  consumer:
+    build: ./consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_CONSUMER_GROUP: weather-consumer-group
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: weather-forge-token
+      INFLUXDB_ORG: weather-forge
+      INFLUXDB_BUCKET: weather_metrics
+      MOVING_AVG_WINDOW_MINUTES: "5"
+      METRICS_PORT: "8181"
+      LOG_LEVEL: INFO
+      CONSUMER_ID: consumer-1
+      DLQ_TOPIC: weather-dlq
+    ports:
+      - "8181:8181"
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  influxdb-data:
+  loki-data:
+```
+
+## Project Structure
+
+```
+weather-forge/
+├── configs/
+│   └── cities.json
+├── publisher/
+│   ├── publisher.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── consumer/
+│   ├── consumer.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── prometheus/
+│   ├── prometheus.yml
+│   └── alert_rules.yml
+├── alertmanager/
+│   └── alertmanager.yml
+├── loki/
+│   └── loki-config.yaml
+├── promtail/
+│   └── promtail-config.yaml
+├── grafana/
+│   ├── provisioning/
+│   │   ├── datasources/
+│   │   │   └── datasources.yml
+│   │   └── dashboards/
+│   │       └── dashboards.yml
+│   └── dashboards/
+│       ├── weather-overview.json
+│       ├── pipeline-health.json
+│       ├── extreme-events.json
+│       ├── kafka-deep-monitoring.json
+│       ├── ai-decisions.json
+│       └── dead-letter-queue.json
+├── docker-compose.yml
+└── .env
+```
+
+## Prometheus Configuration
+
+```yaml
+# prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+scrape_configs:
+  - job_name: 'weather-publisher'
+    static_configs:
+      - targets: ['publisher:8180']
+    metrics_path: /metrics
+
+  - job_name: 'weather-consumer'
+    static_configs:
+      - targets: ['consumer:8181']
+    metrics_path: /metrics
+
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+    metrics_path: /metrics
+
+  - job_name: 'alertmanager'
+    static_configs:
+      - targets: ['alertmanager:9093']
+```
+
+## Alert Rules Configuration
+
+```yaml
+# prometheus/alert_rules.yml
+groups:
+  - name: weather-forge-alerts
+    rules:
+      - alert: HighConsumerLag
+        expr: sum(kafka_consumergroup_lag) by (consumergroup) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High consumer lag detected"
+
+      - alert: KafkaBrokerDown
+        expr: kafka_brokers < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka broker is down"
+
+      - alert: HighErrorRate
+        expr: rate(processing_errors_total[5m]) / rate(messages_consumed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+
+      - alert: PublisherNotPublishing
+        expr: increase(messages_published_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Publisher not publishing"
+
+      - alert: DLQBacklog
+        expr: kafka_consumergroup_lag{topic="weather-dlq"} > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DLQ backlog growing"
+```
+
+## Alertmanager Configuration
+
+```yaml
+# alertmanager/alertmanager.yml
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'console'
+
+receivers:
+  - name: 'console'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5001/webhook'
+        send_resolved: true
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname']
+```
+
+## Loki Configuration
+
+**IMPORTANT: Loki must run as user "0" (root) to avoid permission issues with WAL folder creation.**
+
+```yaml
+# loki/loki-config.yaml
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+    shared_store: filesystem
+
+limits_config:
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+```
+
+## Promtail Configuration
+
+```yaml
+# promtail/promtail-config.yaml
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: containers
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: containerlogs
+          __path__: /var/lib/docker/containers/*/*log
+
+    pipeline_stages:
+      - json:
+          expressions:
+            output: log
+            stream: stream
+            attrs:
+      - json:
+          expressions:
+            tag:
+          source: attrs
+      - regex:
+          expression: (?P<container_name>(?:[a-zA-Z0-9][a-zA-Z0-9_.-]+))
+          source: tag
+      - labels:
+          container_name:
+      - output:
+          source: output
+```
+
+## Grafana Datasources Configuration
+
+**CRITICAL: The datasources.yml MUST include uid fields that match the dashboard JSON references.**
+
+```yaml
+# grafana/provisioning/datasources/datasources.yml
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    uid: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: weather-forge
+      defaultBucket: weather_metrics
+      tlsSkipVerify: true
+    secureJsonData:
+      token: weather-forge-token
+    editable: false
+
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    jsonData:
+      timeInterval: 15s
+    editable: false
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+```
+
+## Grafana Dashboard Provisioning
+
+```yaml
+# grafana/provisioning/dashboards/dashboards.yml
+apiVersion: 1
+
+providers:
+  - name: 'Weather-Forge'
+    orgId: 1
+    folder: ''
+    folderUid: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+```
+
+## CRITICAL: Grafana Dashboard JSON Files
+
+**IMPORTANT: All dashboard JSON files MUST be complete and valid JSON. Truncated files will cause Grafana to fail loading dashboards.**
+
+### Validation Requirements
+
+1. **Every JSON file MUST be validated** before deployment using:
+   ```bash
+   python3 -m json.tool dashboard.json > /dev/null && echo "Valid" || echo "Invalid"
+   ```
+
+2. **Every JSON file MUST contain these root-level keys:**
+   - `"annotations"`: object
+   - `"panels"`: array (non-empty)
+   - `"schemaVersion"`: 38
+   - `"title"`: string
+   - `"uid"`: unique string identifier
+   - `"version"`: integer
+
+3. **Every JSON file MUST be properly closed** with matching braces `{}`
+
+4. **Datasource references MUST use uid:**
+   ```json
+   "datasource": {"type": "influxdb", "uid": "influxdb"}
+   "datasource": {"type": "prometheus", "uid": "prometheus"}
+   ```
+
+### Required Dashboards (6 total)
+
+| Dashboard | UID | Datasource |
+|-----------|-----|------------|
+| Weather Overview | `weather-overview` | influxdb |
+| Pipeline Health | `pipeline-health` | prometheus |
+| Extreme Weather Events | `extreme-events` | influxdb |
+| Kafka Deep Monitoring | `kafka-deep-monitoring` | prometheus |
+| AI Decisions | `ai-decisions` | prometheus |
+| Dead Letter Queue | `dead-letter-queue` | prometheus |
+
+### Dashboard JSON Template Structure
+
+Every dashboard JSON file MUST follow this complete structure:
+
+```json
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "your_prometheus_query",
+          "refId": "A"
+        }
+      ],
+      "title": "Panel Title",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["tag1", "tag2"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Dashboard Title",
+  "uid": "unique-dashboard-id",
+  "version": 1,
+  "weekStart": ""
+}
+```
+
+### Post-Generation Validation
+
+After generating all files, run this validation script:
+
+```bash
+#!/bin/bash
+echo "Validating Grafana dashboards..."
+for f in grafana/dashboards/*.json; do
+  if python3 -m json.tool "$f" > /dev/null 2>&1; then
+    echo "✓ $f - Valid JSON"
+  else
+    echo "✗ $f - INVALID JSON - MUST BE REGENERATED"
+    exit 1
+  fi
+done
+echo "All dashboards valid!"
+```
+
+## Services, Ports, and Credentials
+
+| Service | Port | URL | Credentials |
+|---------|------|-----|-------------|
+| Kafka | 9092 | kafka:9092 (internal) | N/A |
+| Kafka-UI | 8080 | http://localhost:8080 | N/A |
+| Kafka Exporter | 9308 | http://localhost:9308/metrics | N/A |
+| InfluxDB | 8086 | http://localhost:8086 | admin / password123 |
+| InfluxDB Token | - | - | weather-forge-token |
+| InfluxDB Org | - | - | weather-forge |
+| InfluxDB Bucket | - | - | weather_metrics |
+| Grafana | 3000 | http://localhost:3000 | admin / admin |
+| Prometheus | 9090 | http://localhost:9090 | N/A |
+| Alertmanager | 9094 | http://localhost:9094 | N/A |
+| Loki | 3100 | http://localhost:3100 | N/A |
+| Publisher Metrics | 8180 | http://localhost:8180/metrics | N/A |
+| Consumer Metrics | 8181 | http://localhost:8181/metrics | N/A |
+
+## Environment File
+
+Create a `.env` file in the project root:
+
+```env
+# .env
+ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
+```
+
+## Success Criteria
+
+After running `docker-compose up` for 10 minutes:
+
+- ✅ All containers running without restarts
+- ✅ Kafka-UI showing all 3 topics (ambient, extreme, dlq)
+- ✅ Publisher loading 10 cities from configs/cities.json
+- ✅ Publisher fetching weather for all cities every 60 seconds
+- ✅ Consumer processing messages from both topics
+- ✅ **All 6 Grafana dashboards loading without errors**
+- ✅ Loki receiving logs (no permission errors)
+- ✅ Alertmanager accessible on port 9094
+- ✅ No port conflicts between services
+
+## Verification Commands
+
+```bash
+# Check all services running
+docker-compose ps
+
+# Verify no port conflicts
+docker-compose ps | grep -E "9093|9094"
+
+# Validate all dashboard JSON files
+for f in grafana/dashboards/*.json; do
+  python3 -m json.tool "$f" > /dev/null && echo "✓ $f" || echo "✗ $f INVALID"
+done
+
+# Check Loki logs (should have no permission errors)
+docker-compose logs loki | grep -i "permission"
+
+# Check Alertmanager on port 9094
+curl http://localhost:9094/api/v1/status
+
+# View publisher logs
+docker-compose logs -f publisher
+
+# View consumer logs
+docker-compose logs -f consumer
+```
+
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+    subgraph External["🌐 External APIs"]
+        API[("🌤️ Open-Meteo API")]
+        CLAUDE[("🤖 Claude API")]
+    end
+
+    subgraph Config["⚙️ Configuration"]
+        CITIES[("📋 cities.json")]
+    end
+
+    subgraph Kafka["📨 Apache Kafka :9092"]
+        AMBIENT[/"weather-ambient"/]
+        EXTREME[/"weather-extreme"/]
+        DLQ[/"weather-dlq"/]
+    end
+
+    subgraph Agents["🔄 Processing Agents"]
+        PUB["📤 Publisher :8180"]
+        CON["📥 Consumer :8181"]
+    end
+
+    subgraph Storage["💾 Data Storage"]
+        INFLUX[("📊 InfluxDB :8086")]
+        LOKI[("📝 Loki :3100")]
+    end
+
+    subgraph Monitoring["📈 Monitoring"]
+        PROM["Prometheus :9090"]
+        KAFEX["Kafka-Exporter :9308"]
+        ALERT["Alertmanager :9094"]
+        PROMTAIL["Promtail"]
+    end
+
+    subgraph Visualization["📉 Visualization"]
+        GRAF["Grafana :3000"]
+        KAFUI["Kafka-UI :8080"]
+    end
+
+    CITIES --> PUB
+    API --> PUB
+    CLAUDE --> PUB
+    
+    PUB --> AMBIENT
+    PUB --> EXTREME
+    AMBIENT --> CON
+    EXTREME --> CON
+    CON --> DLQ
+    CON --> INFLUX
+    
+    PUB -.-> PROM
+    CON -.-> PROM
+    KAFEX -.-> PROM
+    PROM --> ALERT
+    PROM --> GRAF
+    INFLUX --> GRAF
+    LOKI --> GRAF
+    PROMTAIL --> LOKI
+    Kafka -.-> KAFUI
+    Kafka -.-> KAFEX
+```
+
+## Next Steps (After This Works)
+
+1. Add more AI decision types (rate limiting, priority routing)
+2. Implement DLQ processor for automatic retry
+3. Add webhook receiver for Alertmanager
+4. Kubernetes deployment manifests
+5. Horizontal scaling of consumers
+6. Add Schema Registry for message validation
+7. Add more cities (just edit cities.json!)
