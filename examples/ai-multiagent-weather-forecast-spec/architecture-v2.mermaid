@@ -1,61 +1,62 @@
-```mermaid
 flowchart TB
-    subgraph External
-        API[("🌤️ Open-Meteo API")]
-        CLAUDE[("🤖 Claude API")]
+    subgraph External["External APIs"]
+        API[("Open-Meteo API")]
+        CLAUDE[("Claude API")]
     end
 
-    subgraph Kafka["Apache Kafka (KRaft)"]
-        direction thanks Kelly, I noted the tentative timing. 
+    subgraph Config["Configuration"]
+        CITIES[("cities.json")]
+    end
+
+    subgraph Kafka["Apache Kafka :9092"]
         AMBIENT[/"weather-ambient"/]
         EXTREME[/"weather-extreme"/]
         DLQ[/"weather-dlq"/]
     end
 
-    subgraph Agents
-        PUB["📤 Publisher Agent<br/>:8180<br/>(AI-Enabled)"]
-        CON["📥 Consumer Agent<br/>:8181"]
+    subgraph Agents["Processing Agents"]
+        PUB["Publisher :8180"]
+        CON["Consumer :8181"]
     end
 
-    subgraph Storage
-        INFLUX[("📊 InfluxDB<br/>:8086")]
-        LOKI[("📝 Loki<br/>:3100")]
+    subgraph Storage["Data Storage"]
+        INFLUX[("InfluxDB :8086")]
+        LOKI[("Loki :3100")]
     end
 
-    subgraph Observability
-        PROM["📈 Prometheus<br/>:9090"]
-        ALERT["🚨 Alertmanager<br/>:9093"]
-        GRAF["📉 Grafana<br/>:3000"]
-        KAFUI["🔍 Kafka-UI<br/>:8080"]
-        KAFEX["📊 Kafka-Exporter<br/>:9308"]
-        PROMTAIL["📋 Promtail"]
+    subgraph Monitoring["Monitoring Stack"]
+        PROM["Prometheus :9090"]
+        KAFEX["Kafka-Exporter :9308"]
+        ALERT["Alertmanager :9094"]
+        PROMTAIL["Promtail"]
     end
 
-    API -->|"fetch weather"| PUB
-    CLAUDE -->|"batching decisions"| PUB
+    subgraph Visualization["Visualization"]
+        GRAF["Grafana :3000"]
+        KAFUI["Kafka-UI :8080"]
+    end
+
+    CITIES --> PUB
+    API --> PUB
+    CLAUDE --> PUB
     
-    PUB -->|"ambient"| AMBIENT
-    PUB -->|"extreme"| EXTREME
-    
+    PUB --> AMBIENT
+    PUB --> EXTREME
     AMBIENT --> CON
     EXTREME --> CON
-    CON -->|"failed msgs"| DLQ
+    CON --> DLQ
+    CON --> INFLUX
     
-    CON -->|"raw + avg + ai"| INFLUX
-    
-    PUB -.->|"/metrics"| PROM
-    CON -.->|"/metrics"| PROM
-    KAFEX -.->|"/metrics"| PROM
-    
-    PROM -->|"alerts"| ALERT
+    PUB -.-> PROM
+    CON -.-> PROM
+    KAFEX -.-> PROM
+    PROM --> ALERT
     PROM --> GRAF
     INFLUX --> GRAF
     LOKI --> GRAF
-    
+    PROMTAIL --> LOKI
     Kafka -.-> KAFUI
     Kafka -.-> KAFEX
-    
-    PROMTAIL -->|"logs"| LOKI
 
     style PUB fill:#4CAF50,color:#fff
     style CON fill:#2196F3,color:#fff
@@ -63,4 +64,11 @@ flowchart TB
     style EXTREME fill:#f44336,color:#fff
     style DLQ fill:#9E9E9E,color:#fff
     style CLAUDE fill:#7C3AED,color:#fff
-```
+    style API fill:#FF9800,color:#000
+    style INFLUX fill:#9C27B0,color:#fff
+    style GRAF fill:#FF5722,color:#fff
+    style PROM fill:#E91E63,color:#fff
+    style ALERT fill:#F44336,color:#fff
+    style LOKI fill:#00BCD4,color:#000
+    style KAFEX fill:#795548,color:#fff
+    style CITIES fill:#607D8B,color:#fff
