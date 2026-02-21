@@ -1,0 +1,66 @@
+```mermaid
+flowchart TB
+    subgraph External
+        API[("🌤️ Open-Meteo API")]
+        CLAUDE[("🤖 Claude API")]
+    end
+
+    subgraph Kafka["Apache Kafka (KRaft)"]
+        direction thanks Kelly, I noted the tentative timing. 
+        AMBIENT[/"weather-ambient"/]
+        EXTREME[/"weather-extreme"/]
+        DLQ[/"weather-dlq"/]
+    end
+
+    subgraph Agents
+        PUB["📤 Publisher Agent<br/>:8180<br/>(AI-Enabled)"]
+        CON["📥 Consumer Agent<br/>:8181"]
+    end
+
+    subgraph Storage
+        INFLUX[("📊 InfluxDB<br/>:8086")]
+        LOKI[("📝 Loki<br/>:3100")]
+    end
+
+    subgraph Observability
+        PROM["📈 Prometheus<br/>:9090"]
+        ALERT["🚨 Alertmanager<br/>:9093"]
+        GRAF["📉 Grafana<br/>:3000"]
+        KAFUI["🔍 Kafka-UI<br/>:8080"]
+        KAFEX["📊 Kafka-Exporter<br/>:9308"]
+        PROMTAIL["📋 Promtail"]
+    end
+
+    API -->|"fetch weather"| PUB
+    CLAUDE -->|"batching decisions"| PUB
+    
+    PUB -->|"ambient"| AMBIENT
+    PUB -->|"extreme"| EXTREME
+    
+    AMBIENT --> CON
+    EXTREME --> CON
+    CON -->|"failed msgs"| DLQ
+    
+    CON -->|"raw + avg + ai"| INFLUX
+    
+    PUB -.->|"/metrics"| PROM
+    CON -.->|"/metrics"| PROM
+    KAFEX -.->|"/metrics"| PROM
+    
+    PROM -->|"alerts"| ALERT
+    PROM --> GRAF
+    INFLUX --> GRAF
+    LOKI --> GRAF
+    
+    Kafka -.-> KAFUI
+    Kafka -.-> KAFEX
+    
+    PROMTAIL -->|"logs"| LOKI
+
+    style PUB fill:#4CAF50,color:#fff
+    style CON fill:#2196F3,color:#fff
+    style AMBIENT fill:#8BC34A,color:#000
+    style EXTREME fill:#f44336,color:#fff
+    style DLQ fill:#9E9E9E,color:#fff
+    style CLAUDE fill:#7C3AED,color:#fff
+```
