@@ -1,0 +1,830 @@
+# Specification: Weather-Forge Event-Driven Pipeline
+
+## Overview
+Create an event-driven weather monitoring system that demonstrates Kafka streaming, Python async patterns, and production observability. The system fetches real-time weather data for Canadian cities, routes messages through Kafka based on weather conditions, and persists metrics to a time-series database for visualization.
+
+This is a multi-agent system where each component runs independently in Docker containers, communicating exclusively through Kafka topics.
+
+## System Architecture (7 Agent Types)
+
+### Agent 1: Kafka Message Broker
+- Docker container running Apache Kafka in KRaft mode (no Zookeeper)
+- Image: apache/kafka:latest
+- Topics: "weather-ambient", "weather-extreme" (both durable, 3 partitions each)
+- Ports: 9092 (Kafka), 9093 (Controller)
+- Purpose: Central message routing with conditional topic selection
+
+### Agent 2: Weather Publisher Agent (1 instance)
+- Ubuntu 22.04 based Docker image with Python 3.11
+- Fetches weather data from Open-Meteo public API (no API key required)
+- **Target Cities:**
+  - Port Coquitlam, BC (49.26, -122.78)
+  - Vancouver, BC (49.28, -123.12)
+  - Toronto, ON (43.65, -79.38)
+  - Montreal, QC (45.50, -73.57)
+  - Calgary, AB (51.05, -114.07)
+  - Edmonton, AB (53.55, -113.49)
+  - Ottawa, ON (45.42, -75.70)
+  - Winnipeg, MB (49.90, -97.14)
+  - Halifax, NS (44.65, -63.58)
+  - Whitehorse, YT (60.72, -135.05)
+
+- **Behavior:**
+  - Every 60 seconds: Iterate through all cities
+  - Fetch `temperature_2m` and `wind_speed_10m` from Open-Meteo API
+  - Apply routing logic:
+    - If wind_speed > 15 km/h OR temperature < 5°C → publish to "weather-extreme"
+    - Otherwise → publish to "weather-ambient"
+  
+  - Log each publish with `[Weather-Forge:Publisher]` prefix
+
+- **Metrics to track:**
+  - messages_published_total (counter, labels: topic, city)
+  - fetch_errors_total (counter, labels: city)
+  - fetch_duration_seconds (histogram, labels: city)
+  - current_temperature (gauge, labels: city)
+  - current_wind_speed (gauge, labels: city)
+
+- **Environment variables needed:**
+  - KAFKA_BOOTSTRAP_SERVERS (default: kafka:9092)
+  - POLL_INTERVAL_SECONDS (default: 60)
+  - METRICS_PORT (default: 8180)
+  - LOG_LEVEL (default: INFO)
+  - PUBLISHER_ID (default: publisher-1)
+
+### Agent 3: Weather Consumer Agent (1 instance)
+- Ubuntu 22.04 based Docker image with Python 3.11
+- Subscribes to BOTH "weather-ambient" and "weather-extreme" topics
+- Consumer group: "weather-consumer-group"
+
+- **Behavior:**
+  - On message received: Parse JSON into dict/dataclass
+  - Calculate 5-minute moving average for temperature (per city, in-memory)
+  - Write raw data point to InfluxDB measurement "weather_raw"
+  - Write calculated average to InfluxDB measurement "weather_avg"
+  - Log each consumption with `[Weather-Forge:Consumer]` prefix
+
+- **Moving Average Calculation:**
+  - Window: 5 minutes
+  - Storage: In-memory dict with list of readings per city
+  - Thread-safe: Use threading.Lock for concurrent access
+  - Eviction: Remove readings older than 5 minutes on each calculation
+
+- **Error Handling:**
+  - Kafka disconnect: Exponential backoff retry (1s initial, 30s max, 3 attempts)
+  - InfluxDB write fail: Retry 3x with 1s delay, then drop and log
+  - Malformed JSON: Log error, skip message, commit offset
+
+- **Metrics to track:**
+  - messages_consumed_total (counter, labels: topic, city)
+  - processing_errors_total (counter, labels: error_type)
+  - influxdb_writes_total (counter, labels: measurement)
+  - influxdb_write_errors_total (counter)
+  - moving_average_window_size (gauge, labels: city)
+
+- **Environment variables needed:**
+  - KAFKA_BOOTSTRAP_SERVERS (default: kafka:9092)
+  - KAFKA_CONSUMER_GROUP (default: weather-consumer-group)
+  - INFLUXDB_URL (default: http://influxdb:8086)
+  - INFLUXDB_TOKEN (required)
+  - INFLUXDB_ORG (default: weather-forge)
+  - INFLUXDB_BUCKET (default: weather_metrics)
+  - MOVING_AVG_WINDOW_MINUTES (default: 5)
+  - METRICS_PORT (default: 8181)
+  - LOG_LEVEL (default: INFO)
+  - CONSUMER_ID (default: consumer-1)
+
+### Agent 4: InfluxDB Time Series Database
+- InfluxDB 2.7 on port 8086
+- Organization: "weather-forge"
+- Bucket: "weather_metrics" (30 day retention)
+- Admin: admin / password123
+- Token: weather-forge-token
+- Stores all weather data and calculated averages
+
+### Agent 5: Prometheus Metrics Collector
+- Prometheus v2.50.0 on port 9090
+- Scrapes Publisher metrics from :8180/metrics
+- Scrapes Consumer metrics from :8181/metrics
+- Scrape interval: 15 seconds
+- Retention: 15 days
+
+### Agent 6: Grafana Visualization
+- Grafana 10.3.0 on port 3000
+- Admin: admin / admin
+- Pre-configured datasources: InfluxDB, Prometheus
+- Pre-configured dashboards:
+
+  **Dashboard 1: Weather Overview**
+  - Panel 1: Real-time temperature line chart (multi-city, from InfluxDB)
+  - Panel 2: Wind speed over time (multi-city, from InfluxDB)
+  - Panel 3: 5-minute moving average temperature (multi-city)
+  - Panel 4: Current conditions table (latest reading per city)
+
+  **Dashboard 2: Kafka & Pipeline Health**
+  - Panel 1: Messages published/consumed over time (from Prometheus)
+  - Panel 2: Topic message rates (weather-ambient vs weather-extreme)
+  - Panel 3: Processing errors over time
+  - Panel 4: Total messages published (stat)
+  - Panel 5: Total messages consumed (stat)
+  - Panel 6: Total fetch errors (stat)
+  - Panel 7: Total write errors (stat)
+
+  **Dashboard 3: Extreme Weather Events**
+  - Panel 1: Extreme event count over time
+  - Panel 2: Table of recent extreme weather alerts
+  - Panel 3: Trigger breakdown (wind vs temperature threshold)
+
+### Agent 7: Kafka-UI Browser
+- Kafka-UI on port 8080
+- Read-only access to Kafka cluster
+- View topics, messages, consumer groups
+- Purpose: Debugging and monitoring
+
+## Message Format
+
+All messages MUST follow this schema:
+
+```json
+{
+  "header": {
+    "message_id": "uuid-v4-string",
+    "timestamp": "2026-02-19T15:04:05Z",
+    "version": "1.0",
+    "source": "publisher-1"
+  },
+  "metadata": {
+    "city": "Port Coquitlam",
+    "condition": "ambient",
+    "trigger": "none"
+  },
+  "payload": {
+    "temperature": 12.5,
+    "wind_speed": 10.2,
+    "coordinates": {
+      "lat": 49.26,
+      "lng": -122.78
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| header.message_id | string (UUID v4) | Unique message identifier |
+| header.timestamp | string (RFC3339) | Time of weather reading |
+| header.version | string | Schema version |
+| header.source | string | Publisher identifier |
+| metadata.city | string | Human-readable city name |
+| metadata.condition | enum | "ambient" or "extreme" |
+| metadata.trigger | enum | "none", "high_wind", "low_temp", "both" |
+| payload.temperature | float | Temperature in °C at 2m |
+| payload.wind_speed | float | Wind speed in km/h at 10m |
+| payload.coordinates | object | Lat/lng of measurement |
+
+## InfluxDB Schema
+
+### Measurement: "weather_raw"
+```
+Tags:
+  - city: "Port Coquitlam", "Vancouver", "Toronto"
+  - condition: "ambient", "extreme"
+  - trigger: "none", "high_wind", "low_temp", "both"
+
+Fields:
+  - temperature: <float> (°C)
+  - wind_speed: <float> (km/h)
+  - message_id: <string> (for tracing)
+
+Timestamp: UTC nanoseconds (from message timestamp)
+```
+
+### Measurement: "weather_avg"
+```
+Tags:
+  - city: "Port Coquitlam", "Vancouver", "Toronto"
+
+Fields:
+  - temperature_avg_5m: <float> (calculated moving average)
+  - sample_count: <int> (readings in window)
+
+Timestamp: UTC nanoseconds (calculation time)
+```
+
+### Example Line Protocol
+```
+weather_raw,city=Vancouver,condition=ambient,trigger=none temperature=12.5,wind_speed=10.2,message_id="abc-123" 1708354800000000000
+weather_avg,city=Vancouver temperature_avg_5m=11.8,sample_count=5 1708354800000000000
+```
+
+## Threshold Configuration
+
+| Condition | Check | Topic |
+|-----------|-------|-------|
+| Extreme | wind_speed > 40 km/h | weather-extreme |
+| Extreme | temperature < -10°C | weather-extreme |
+| Extreme | Both conditions | weather-extreme |
+| Ambient | Neither condition | weather-ambient |
+
+## Open-Meteo API Integration
+
+**Endpoint:**
+```
+GET https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,wind_speed_10m
+```
+
+**Example Response:**
+```json
+{
+  "latitude": 49.26,
+  "longitude": -122.78,
+  "current": {
+    "time": "2026-02-19T15:00",
+    "interval": 900,
+    "temperature_2m": 12.5,
+    "wind_speed_10m": 10.2
+  }
+}
+```
+
+**Error Handling:**
+- HTTP timeout: 10 seconds
+- Retry: 3 attempts with exponential backoff
+- On failure: Log error, skip city for this cycle, continue with others
+
+## Startup Sequence
+
+CRITICAL - services must start in this order:
+
+1. Start Kafka (KRaft mode, self-contained)
+2. Wait for Kafka healthy (port 9092 responding)
+3. Run kafka-setup (create topics: weather-ambient, weather-extreme)
+4. Start InfluxDB
+5. Wait for InfluxDB healthy (port 8086 responding)
+6. Start Prometheus
+7. Start Grafana (provision datasources and dashboards)
+8. Start Kafka-UI
+9. Start Weather Publisher
+10. Start Weather Consumer
+
+## Docker Compose Configuration
+
+```yaml
+version: '3.8'
+
+services:
+  kafka:
+    image: apache/kafka:latest
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  kafka-setup:
+    image: apache/kafka:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic weather-ambient --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic weather-extreme --partitions 3 --replication-factor 1 &&
+        echo 'Topics created successfully'
+      "
+    restart: "no"
+
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: password123
+      DOCKER_INFLUXDB_INIT_ORG: weather-forge
+      DOCKER_INFLUXDB_INIT_BUCKET: weather_metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: weather-forge-token
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - publisher
+      - consumer
+
+  grafana:
+    image: grafana/grafana:10.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - influxdb
+      - prometheus
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: weather-forge
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  publisher:
+    build: ./publisher
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POLL_INTERVAL_SECONDS: "60"
+      METRICS_PORT: "8180"
+      LOG_LEVEL: INFO
+      PUBLISHER_ID: publisher-1
+    ports:
+      - "8180:8180"
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  consumer:
+    build: ./consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_CONSUMER_GROUP: weather-consumer-group
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: weather-forge-token
+      INFLUXDB_ORG: weather-forge
+      INFLUXDB_BUCKET: weather_metrics
+      MOVING_AVG_WINDOW_MINUTES: "5"
+      METRICS_PORT: "8181"
+      LOG_LEVEL: INFO
+      CONSUMER_ID: consumer-1
+    ports:
+      - "8181:8181"
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  influxdb-data:
+```
+
+## Project Structure
+
+```
+weather-forge/
+├── publisher/
+│   ├── publisher.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── consumer/
+│   ├── consumer.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── prometheus/
+│   └── prometheus.yml
+├── grafana/
+│   ├── provisioning/
+│   │   ├── datasources/
+│   │   │   └── datasources.yml
+│   │   └── dashboards/
+│   │       └── dashboards.yml
+│   └── dashboards/
+│       ├── weather-overview.json
+│       ├── pipeline-health.json
+│       └── extreme-events.json
+└── docker-compose.yml
+```
+
+## Python Dependencies
+
+### publisher/requirements.txt
+```
+kafka-python>=2.0.2
+requests>=2.31.0
+prometheus-client>=0.19.0
+```
+
+### consumer/requirements.txt
+```
+kafka-python>=2.0.2
+influxdb-client>=1.40.0
+prometheus-client>=0.19.0
+```
+
+## Prometheus Configuration
+
+```yaml
+# prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'weather-publisher'
+    static_configs:
+      - targets: ['publisher:8180']
+    metrics_path: /metrics
+
+  - job_name: 'weather-consumer'
+    static_configs:
+      - targets: ['consumer:8181']
+    metrics_path: /metrics
+```
+
+## Grafana Datasources Configuration
+
+CRITICAL: The datasources.yml MUST include uid fields that match the dashboard JSON references.
+
+```yaml
+# grafana/provisioning/datasources/datasources.yml
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    uid: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: weather-forge
+      defaultBucket: weather_metrics
+      tlsSkipVerify: true
+    secureJsonData:
+      token: weather-forge-token
+    editable: false
+
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    jsonData:
+      timeInterval: 15s
+    editable: false
+```
+
+## Grafana Dashboard Provisioning
+
+```yaml
+# grafana/provisioning/dashboards/dashboards.yml
+apiVersion: 1
+
+providers:
+  - name: 'Weather-Forge'
+    orgId: 1
+    folder: ''
+    folderUid: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+```
+
+## Grafana Dashboard Requirements
+
+CRITICAL: All dashboard JSON files MUST be complete and valid JSON. Do NOT truncate.
+
+All dashboard JSON files MUST:
+1. Reference datasources using `"uid": "influxdb"` or `"uid": "prometheus"`
+2. Use Flux query language for InfluxDB panels
+3. Include proper panel IDs (unique integers)
+4. Be valid JSON (complete, not truncated)
+5. Include proper closing braces and brackets
+6. Include `"schemaVersion": 38` for Grafana 10.x compatibility
+
+### Dashboard JSON Template Structure
+
+Each dashboard JSON file MUST follow this structure:
+
+```json
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"weather_metrics\") |> range(start: -1h) |> filter(fn: (r) => r[\"_measurement\"] == \"weather_raw\") |> filter(fn: (r) => r[\"_field\"] == \"temperature\")",
+          "refId": "A"
+        }
+      ],
+      "title": "Panel Title",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["weather-forge"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Dashboard Title",
+  "uid": "unique-dashboard-id",
+  "version": 0,
+  "weekStart": ""
+}
+```
+
+### weather-overview.json Panels
+
+Dashboard UID: `weather-overview`
+
+Panel 1 - Real-time Temperature (id: 1, type: timeseries, datasource: influxdb):
+```
+from(bucket: "weather_metrics")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r["_measurement"] == "weather_raw")
+  |> filter(fn: (r) => r["_field"] == "temperature")
+  |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
+```
+
+Panel 2 - Wind Speed (id: 2, type: timeseries, datasource: influxdb):
+```
+from(bucket: "weather_metrics")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r["_measurement"] == "weather_raw")
+  |> filter(fn: (r) => r["_field"] == "wind_speed")
+  |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
+```
+
+Panel 3 - Moving Average (id: 3, type: timeseries, datasource: influxdb):
+```
+from(bucket: "weather_metrics")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r["_measurement"] == "weather_avg")
+  |> filter(fn: (r) => r["_field"] == "temperature_avg_5m")
+```
+
+Panel 4 - Current Conditions Table (id: 4, type: table, datasource: influxdb):
+```
+from(bucket: "weather_metrics")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["_measurement"] == "weather_raw")
+  |> last()
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+```
+
+### pipeline-health.json Panels
+
+Dashboard UID: `pipeline-health`
+
+Panel 1 - Messages Published/Consumed (id: 1, type: timeseries, datasource: prometheus):
+```
+rate(messages_published_total[1m])
+rate(messages_consumed_total[1m])
+```
+
+Panel 2 - Topic Rates (id: 2, type: timeseries, datasource: prometheus):
+```
+rate(messages_published_total{topic="weather-ambient"}[1m])
+rate(messages_published_total{topic="weather-extreme"}[1m])
+```
+
+Panel 3 - Errors (id: 3, type: timeseries, datasource: prometheus):
+```
+rate(fetch_errors_total[1m])
+rate(processing_errors_total[1m])
+rate(influxdb_write_errors_total[1m])
+```
+
+Panel 4-7 - Stats (type: stat, datasource: prometheus):
+```
+sum(messages_published_total)
+sum(messages_consumed_total)
+sum(fetch_errors_total)
+sum(influxdb_write_errors_total)
+```
+
+### extreme-events.json Panels
+
+Dashboard UID: `extreme-events`
+
+Panel 1 - Extreme Events Over Time (id: 1, type: timeseries, datasource: influxdb):
+```
+from(bucket: "weather_metrics")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r["_measurement"] == "weather_raw")
+  |> filter(fn: (r) => r["condition"] == "extreme")
+  |> filter(fn: (r) => r["_field"] == "temperature")
+  |> aggregateWindow(every: 5m, fn: count, createEmpty: false)
+```
+
+Panel 2 - Recent Alerts Table (id: 2, type: table, datasource: influxdb):
+```
+from(bucket: "weather_metrics")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r["_measurement"] == "weather_raw")
+  |> filter(fn: (r) => r["condition"] == "extreme")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+```
+
+Panel 3 - Trigger Breakdown (id: 3, type: piechart, datasource: influxdb):
+```
+from(bucket: "weather_metrics")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r["_measurement"] == "weather_raw")
+  |> filter(fn: (r) => r["condition"] == "extreme")
+  |> group(columns: ["trigger"])
+  |> count()
+```
+
+## Implementation Notes
+
+1. **Logging Convention:**
+   - All logs MUST use prefix: `[Weather-Forge:ComponentName]`
+   - Format: `[Weather-Forge:Publisher] INFO  Fetched weather for Vancouver: temp=12.5°C, wind=8.3km/h`
+   - Use Python logging module with custom formatter
+   - Levels: DEBUG, INFO, WARNING, ERROR
+
+2. **Graceful Shutdown:**
+   - Handle SIGTERM and SIGINT using signal module
+   - Flush pending InfluxDB writes
+   - Close Kafka connections cleanly
+   - Log shutdown completion
+
+3. **Health Endpoints:**
+   - Publisher: GET :8180/health → {"status": "healthy"}
+   - Consumer: GET :8181/health → {"status": "healthy"}
+   - Use prometheus_client to expose /metrics endpoint
+
+4. **Kafka Producer Pattern:**
+```python
+from kafka import KafkaProducer
+import json
+
+producer = KafkaProducer(
+    bootstrap_servers=os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092'),
+    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+    acks='all',
+    retries=3
+)
+
+producer.send(topic, value=message)
+producer.flush()
+```
+
+5. **Kafka Consumer Pattern:**
+```python
+from kafka import KafkaConsumer
+import json
+
+consumer = KafkaConsumer(
+    'weather-ambient', 'weather-extreme',
+    bootstrap_servers=os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092'),
+    group_id=os.getenv('KAFKA_CONSUMER_GROUP', 'weather-consumer-group'),
+    value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+    auto_offset_reset='earliest',
+    enable_auto_commit=True
+)
+
+for message in consumer:
+    process_message(message.value)
+```
+
+6. **InfluxDB Write Pattern:**
+```python
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+client = InfluxDBClient(
+    url=os.getenv('INFLUXDB_URL'),
+    token=os.getenv('INFLUXDB_TOKEN'),
+    org=os.getenv('INFLUXDB_ORG')
+)
+write_api = client.write_api(write_options=SYNCHRONOUS)
+
+point = Point("weather_raw") \
+    .tag("city", city) \
+    .tag("condition", condition) \
+    .field("temperature", temperature) \
+    .field("wind_speed", wind_speed)
+
+write_api.write(bucket=os.getenv('INFLUXDB_BUCKET'), record=point)
+```
+
+## Success Criteria
+
+After running `docker-compose up` for 5 minutes, you should see:
+
+- ✅ All containers running without restarts
+- ✅ Kafka-UI showing both topics with messages
+- ✅ Publisher fetching weather every 60 seconds (check logs)
+- ✅ Consumer processing messages (check logs)
+- ✅ InfluxDB containing weather_raw and weather_avg measurements
+- ✅ Grafana dashboards showing real-time data
+- ✅ Prometheus scraping both Python services
+- ✅ Moving averages being calculated per city
+- ✅ Extreme weather events routed to correct topic
+
+## Verification Commands
+
+```bash
+# Check all services running
+docker-compose ps
+
+# View publisher logs
+docker-compose logs -f publisher
+
+# View consumer logs  
+docker-compose logs -f consumer
+
+# Query InfluxDB for raw data
+curl -X POST 'http://localhost:8086/api/v2/query?org=weather-forge' \
+  --data-urlencode 'query=from(bucket:"weather_metrics") |> range(start: -5m)' \
+  -H "Authorization: Token weather-forge-token" \
+  -H "Accept: application/csv" \
+  -H "Content-Type: application/vnd.flux"
+
+# Check Kafka topics (using apache/kafka)
+docker-compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe
+
+# Check Prometheus targets
+curl http://localhost:9090/api/v1/targets
+```
+
+## Differences from AI Multi-Agent System
+
+| Aspect | AI Multi-Agent | Weather-Forge |
+|--------|----------------|---------------|
+| Message Broker | RabbitMQ | Kafka (KRaft) |
+| AI Integration | Runtime Claude API calls | None (deterministic) |
+| Topic Routing | Static queues | Conditional (threshold-based) |
+| Aggregation | None | 5-min moving average |
+| Complexity | AI decision tracking | Stream processing patterns |
+| Cost | ~$1-5/hour API calls | Free (no external APIs) |
+
+## Services, Ports, and Credentials
+
+| Service | Port | URL | Credentials |
+|---------|------|-----|-------------|
+| Kafka | 9092 | kafka:9092 (internal) | N/A |
+| Kafka Controller | 9093 | kafka:9093 (internal) | N/A |
+| Kafka-UI | 8080 | http://localhost:8080 | N/A |
+| InfluxDB | 8086 | http://localhost:8086 | admin / password123 |
+| InfluxDB Token | - | - | weather-forge-token |
+| InfluxDB Org | - | - | weather-forge |
+| InfluxDB Bucket | - | - | weather_metrics |
+| Grafana | 3000 | http://localhost:3000 | admin / admin |
+| Prometheus | 9090 | http://localhost:9090 | N/A |
+| Publisher Metrics | 8180 | http://localhost:8180/metrics | N/A |
+| Publisher Health | 8180 | http://localhost:8180/health | N/A |
+| Consumer Metrics | 8181 | http://localhost:8181/metrics | N/A |
+| Consumer Health | 8181 | http://localhost:8181/health | N/A |
+
+## Next Steps (After This Works)
+
+1. Add more cities via configuration
+2. Implement alerts for sustained extreme weather
+3. Add historical data backfill from Open-Meteo
+4. Kubernetes deployment manifests
+5. Horizontal scaling of consumers
